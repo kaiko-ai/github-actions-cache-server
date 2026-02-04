@@ -56,6 +56,16 @@ jobs:
           VITEST_DB_DRIVER: ${{ matrix.db-driver }}
           VITEST_STORAGE_DRIVER: ${{ matrix.storage-driver }}
 
+  benchmark:
+    name: 📊 Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: pnpm install
+        uses: falcondev-it/.github/actions/pnpm-install@master
+
+      - name: Run benchmark
+        run: pnpm run benchmark
+
   deploy:
     if: github.event.ref == 'refs/heads/dev'
     name: 🚀 Build and push
