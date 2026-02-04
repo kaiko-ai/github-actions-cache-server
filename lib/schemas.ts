@@ -63,6 +63,7 @@ export const envBaseSchema = type({
   'ENABLE_DIRECT_DOWNLOADS': 'boolean = false',
   'BENCHMARK': 'boolean = false',
   'METRICS_ENABLED': 'boolean = false',
+  'STORAGE_HIGH_WATER_MARK': 'number = 1048576', // 1MB default
 })
 
 export const envSchema = envBaseSchema.and(envStorageDriverSchema).and(envDbDriverSchema)

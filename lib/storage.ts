@@ -618,7 +618,9 @@ class FileSystemAdapter implements StorageAdapter {
   }
 
   async createDownloadStream(objectName: string) {
-    return createReadStream(path.join(this.rootFolder, objectName))
+    return createReadStream(path.join(this.rootFolder, objectName), {
+      highWaterMark: env.STORAGE_HIGH_WATER_MARK,
+    })
   }
 
   async deleteFolder(folderName: string) {
