@@ -630,9 +630,12 @@ class FileSystemAdapter implements StorageAdapter {
   async uploadStream(objectName: string, stream: Readable) {
     const filePath = path.join(this.rootFolder, objectName)
     await fs.mkdir(path.dirname(filePath), { recursive: true })
-    await pipeline(stream, createWriteStream(filePath, {
-      highWaterMark: env.STORAGE_HIGH_WATER_MARK,
-    }))
+    await pipeline(
+      stream,
+      createWriteStream(filePath, {
+        highWaterMark: env.STORAGE_HIGH_WATER_MARK,
+      }),
+    )
   }
 
   async countFilesInFolder(folderName: string) {

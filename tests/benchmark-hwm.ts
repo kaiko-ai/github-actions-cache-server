@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 import { randomBytes } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { unlink, writeFile } from 'node:fs/promises'
