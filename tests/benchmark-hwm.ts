@@ -4,10 +4,11 @@ import { unlink, writeFile } from 'node:fs/promises'
 
 import { envBaseSchema } from '../lib/schemas.js'
 
-// Get the default value from the schema
-const optionals = envBaseSchema.structure?.inner?.optional || []
-const hwmNode = optionals.find((n: { key: string }) => n.key === 'STORAGE_HIGH_WATER_MARK')
-const CURRENT_HIGH_WATER_MARK = (hwmNode?.default as number) ?? 1024 * 1024
+// Get the default value from the schema JSON representation
+type SchemaOptional = { key: string; default?: number }
+const schemaJson = envBaseSchema.json as { optional?: SchemaOptional[] }
+const hwmNode = schemaJson.optional?.find((n) => n.key === 'STORAGE_HIGH_WATER_MARK')
+const CURRENT_HIGH_WATER_MARK = hwmNode?.default ?? 1024 * 1024
 
 function formatSize(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${bytes / (1024 * 1024)}MB`
