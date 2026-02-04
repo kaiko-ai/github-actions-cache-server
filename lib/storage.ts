@@ -40,6 +40,7 @@ function createByteCountingTransform(
   let bytesTransferred = 0
 
   return new Transform({
+    highWaterMark: env.STORAGE_HIGH_WATER_MARK,
     transform(chunk: any, _encoding, callback) {
       bytesTransferred += chunk.length
       callback(null, chunk)
@@ -325,8 +326,6 @@ class Storage {
 
     responseStream.end()
     mergerStream.end()
-
-    await globalThis.gc?.()
   }
 
   private async *streamParts(location: StorageLocation) {
@@ -357,8 +356,6 @@ class Storage {
           console.error('Failed to record download bytes:', err)
         }
       }
-
-      await globalThis.gc?.()
     }
   }
 
@@ -633,7 +630,9 @@ class FileSystemAdapter implements StorageAdapter {
   async uploadStream(objectName: string, stream: Readable) {
     const filePath = path.join(this.rootFolder, objectName)
     await fs.mkdir(path.dirname(filePath), { recursive: true })
-    await pipeline(stream, createWriteStream(filePath))
+    await pipeline(stream, createWriteStream(filePath, {
+      highWaterMark: env.STORAGE_HIGH_WATER_MARK,
+    }))
   }
 
   async countFilesInFolder(folderName: string) {
