@@ -2,20 +2,23 @@ package bench
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/falcosecurity/github-actions-cache-server/internal/config"
+	"github.com/falcosecurity/github-actions-cache-server/internal/server"
 )
 
 var (
@@ -27,13 +30,11 @@ func BenchmarkCacheServer(b *testing.B) {
 	fileSizes := parseEnvIntList(b, "BENCH_FILE_SIZES_MB", defaultFileSizesMB)
 	bufferSizes := parseEnvIntList(b, "BENCH_BUFFER_SIZES_KB", defaultBufferSizesKB)
 
-	binary := buildServerBinary(b)
-
 	for _, bufferKB := range bufferSizes {
 		bufferBytes := bufferKB * 1024
 
 		b.Run(fmt.Sprintf("buffer_%dKB", bufferKB), func(b *testing.B) {
-			baseURL, stop := startServer(b, binary, bufferBytes)
+			baseURL, stop := startServer(b, bufferBytes)
 			defer stop()
 
 			client := newCacheClient(baseURL)
@@ -262,143 +263,7 @@ func (c *cacheClient) download(downloadURL string) ([]byte, error) {
 	return data, nil
 }
 
-var (
-	serverBuildOnce sync.Once
-	serverBuildErr  error
-	serverBinary    string
-)
-
-func buildServerBinary(b testing.TB) string {
-	b.Helper()
-
-	serverBuildOnce.Do(func() {
-		root := repoRoot()
-		if !hasServerDir(root) {
-			serverBuildErr = fmt.Errorf("cmd/server not found under %s", root)
-			return
-		}
-
-		tempDir, err := os.MkdirTemp("", "cache-server-bench-*")
-		if err != nil {
-			serverBuildErr = err
-			return
-		}
-
-		serverBinary = filepath.Join(tempDir, "cache-server")
-
-		cmd := exec.Command("go", "build", "-o", serverBinary, "./cmd/server")
-		cmd.Dir = root
-		cmd.Stdout = io.Discard
-		cmd.Stderr = os.Stderr
-
-		serverBuildErr = cmd.Run()
-	})
-
-	if serverBuildErr != nil {
-		b.Fatalf("failed to build server: %v", serverBuildErr)
-	}
-
-	return serverBinary
-}
-
-func repoRoot() string {
-	candidates := []string{}
-
-	if workspace := strings.TrimSpace(os.Getenv("GITHUB_WORKSPACE")); workspace != "" {
-		candidates = append(candidates, workspace)
-	}
-
-	if gomod := strings.TrimSpace(os.Getenv("GOMOD")); gomod != "" && gomod != os.DevNull {
-		candidates = append(candidates, filepath.Dir(gomod))
-	}
-
-	if root, err := moduleRootFromGoEnv(); err == nil && root != "" {
-		candidates = append(candidates, root)
-	}
-
-	if root, err := moduleRootFromGoList(); err == nil && root != "" {
-		candidates = append(candidates, root)
-	}
-
-	wd, err := os.Getwd()
-	if err != nil {
-		return "."
-	}
-	candidates = append(candidates, wd)
-
-	for _, candidate := range candidates {
-		if root, ok := findRootUpwards(candidate); ok {
-			return root
-		}
-	}
-
-	return wd
-}
-
-func moduleRootFromGoEnv() (string, error) {
-	cmd := exec.Command("go", "env", "GOMOD")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("go env GOMOD: %w", err)
-	}
-
-	gomod := strings.TrimSpace(string(output))
-	if gomod == "" || gomod == os.DevNull {
-		return "", fmt.Errorf("GOMOD is empty")
-	}
-
-	return filepath.Dir(gomod), nil
-}
-
-func moduleRootFromGoList() (string, error) {
-	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("go list -m: %w", err)
-	}
-
-	root := strings.TrimSpace(string(output))
-	if root == "" {
-		return "", fmt.Errorf("module root is empty")
-	}
-	return root, nil
-}
-
-func hasServerDir(root string) bool {
-	if root == "" {
-		return false
-	}
-	info, err := os.Stat(filepath.Join(root, "cmd", "server"))
-	if err != nil {
-		return false
-	}
-	return info.IsDir()
-}
-
-func findRootUpwards(start string) (string, bool) {
-	if start == "" {
-		return "", false
-	}
-
-	current, err := filepath.Abs(start)
-	if err != nil {
-		return "", false
-	}
-
-	for {
-		if hasServerDir(current) {
-			return current, true
-		}
-
-		parent := filepath.Dir(current)
-		if parent == current {
-			return "", false
-		}
-		current = parent
-	}
-}
-
-func startServer(b testing.TB, binary string, bufferBytes int) (string, func()) {
+func startServer(b testing.TB, bufferBytes int) (string, func()) {
 	b.Helper()
 
 	tempDir := b.TempDir()
@@ -409,50 +274,77 @@ func startServer(b testing.TB, binary string, bufferBytes int) (string, func()) 
 		b.Fatalf("failed to create storage directory: %v", err)
 	}
 
-	port := freePort(b)
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to allocate port: %v", err)
+	}
 
-	cmd := exec.Command(binary)
-	cmd.Env = append(os.Environ(),
-		"PORT="+strconv.Itoa(port),
-		"API_BASE_URL="+baseURL,
-		"STORAGE_DRIVER=filesystem",
-		"STORAGE_FILESYSTEM_PATH="+storagePath,
-		"DB_DRIVER=sqlite",
-		"DB_SQLITE_PATH="+dbPath,
-		fmt.Sprintf("STORAGE_HIGH_WATER_MARK=%d", bufferBytes),
-		"METRICS_ENABLED=false",
-	)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	baseURL := fmt.Sprintf("http://%s", listener.Addr().String())
+	port := listener.Addr().(*net.TCPAddr).Port
 
-	if err := cmd.Start(); err != nil {
+	cfg := &config.Config{
+		StorageDriver:         "filesystem",
+		StorageHighWaterMark:  bufferBytes,
+		StorageFilesystemPath: storagePath,
+		DBDriver:              "sqlite",
+		DBSqlitePath:          dbPath,
+		APIBaseURL:            baseURL,
+		Port:                  port,
+		MetricsEnabled:        false,
+		Debug:                 false,
+		Benchmark:             true,
+		DisableCleanupJobs:    true,
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	app, err := server.New(context.Background(), cfg, logger)
+	if err != nil {
+		_ = listener.Close()
 		b.Fatalf("failed to start server: %v", err)
 	}
 
-	if err := waitForHealth(baseURL, 30*time.Second); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- app.Serve(listener)
+	}()
+
+	select {
+	case err := <-errCh:
+		b.Fatalf("server failed to start: %v", err)
+	default:
+	}
+
+	if err := waitForHealth(baseURL, 30*time.Second, errCh); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = app.Shutdown(ctx)
+		_ = listener.Close()
 		b.Fatalf("server health check failed: %v", err)
 	}
 
 	stop := func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = app.Shutdown(ctx)
+		_ = listener.Close()
 	}
 
 	return baseURL, stop
 }
 
-func waitForHealth(baseURL string, timeout time.Duration) error {
+func waitForHealth(baseURL string, timeout time.Duration, errCh <-chan error) error {
 	deadline := time.Now().Add(timeout)
 	healthURL := baseURL + "/health"
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			return fmt.Errorf("server error: %w", err)
+		default:
+		}
+
 		resp, err := client.Get(healthURL)
 		if err == nil {
 			resp.Body.Close()
@@ -466,18 +358,6 @@ func waitForHealth(baseURL string, timeout time.Duration) error {
 	}
 
 	return fmt.Errorf("timeout waiting for health")
-}
-
-func freePort(b testing.TB) int {
-	b.Helper()
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("failed to allocate port: %v", err)
-	}
-	defer l.Close()
-
-	return l.Addr().(*net.TCPAddr).Port
 }
 
 func parseEnvIntList(b testing.TB, key string, defaultValues []int) []int {
