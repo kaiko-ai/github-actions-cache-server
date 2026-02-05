@@ -196,6 +196,31 @@ func (s *S3Adapter) ListFilesInFolder(ctx context.Context, folderName string) ([
 	return files, nil
 }
 
+// GetFolderSize returns the total size of all files in a folder.
+func (s *S3Adapter) GetFolderSize(ctx context.Context, folderName string) (int64, error) {
+	prefix := s.fullKey(folderName) + "/"
+
+	var total int64
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return 0, err
+		}
+		for _, obj := range page.Contents {
+			if obj.Size != nil {
+				total += *obj.Size
+			}
+		}
+	}
+
+	return total, nil
+}
+
 // CreateDownloadURL creates a presigned URL for downloading.
 func (s *S3Adapter) CreateDownloadURL(ctx context.Context, objectName string, expiry time.Duration) (string, error) {
 	req, err := s.presignClient.PresignGetObject(ctx, &s3.GetObjectInput{

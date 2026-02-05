@@ -320,6 +320,100 @@ func TestFilesystemAdapter_ListFilesInFolder_NonSequential(t *testing.T) {
 	}
 }
 
+func TestFilesystemAdapter_GetFolderSize(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fs-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	adapter, err := NewFilesystemAdapter(tmpDir, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Create files with known sizes
+	files := map[string][]byte{
+		"parts/0": make([]byte, 100),
+		"parts/1": make([]byte, 200),
+		"parts/2": make([]byte, 300),
+	}
+
+	var expectedTotal int64
+	for name, data := range files {
+		expectedTotal += int64(len(data))
+		err := adapter.UploadStream(ctx, name, bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("failed to upload %s: %v", name, err)
+		}
+	}
+
+	size, err := adapter.GetFolderSize(ctx, "parts")
+	if err != nil {
+		t.Fatalf("GetFolderSize failed: %v", err)
+	}
+
+	if size != expectedTotal {
+		t.Errorf("expected size %d, got %d", expectedTotal, size)
+	}
+}
+
+func TestFilesystemAdapter_GetFolderSize_Nonexistent(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fs-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	adapter, err := NewFilesystemAdapter(tmpDir, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	size, err := adapter.GetFolderSize(ctx, "nonexistent")
+	if err != nil {
+		t.Fatalf("GetFolderSize failed: %v", err)
+	}
+
+	if size != 0 {
+		t.Errorf("expected size 0 for nonexistent folder, got %d", size)
+	}
+}
+
+func TestFilesystemAdapter_GetFolderSize_Empty(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fs-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	adapter, err := NewFilesystemAdapter(tmpDir, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Create empty folder
+	emptyDir := filepath.Join(tmpDir, "emptyparts")
+	if err := os.MkdirAll(emptyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	size, err := adapter.GetFolderSize(ctx, "emptyparts")
+	if err != nil {
+		t.Fatalf("GetFolderSize failed: %v", err)
+	}
+
+	if size != 0 {
+		t.Errorf("expected size 0 for empty folder, got %d", size)
+	}
+}
+
 func TestFilesystemAdapter_SignedURL(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "fs-test-*")
 	if err != nil {

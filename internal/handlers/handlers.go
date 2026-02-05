@@ -361,8 +361,26 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Count uploaded parts
 	partsFolder := fmt.Sprintf("%s/parts", upload.FolderName)
+
+	// Parse expected size from request and wait for all bytes to arrive
+	var expectedSize int64
+	if req.SizeBytes != "" {
+		expectedSize, _ = req.SizeBytes.Int64()
+	}
+
+	if expectedSize > 0 {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			actualSize, err := h.storage.GetFolderSize(ctx, partsFolder)
+			if err == nil && actualSize >= expectedSize {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
+	// Count uploaded parts
 	partCount, err := h.storage.CountFilesInFolder(ctx, partsFolder)
 	if err != nil {
 		h.logger.Error("failed to count parts", "error", err)

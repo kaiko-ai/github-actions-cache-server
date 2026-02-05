@@ -108,6 +108,30 @@ func (f *FilesystemAdapter) ListFilesInFolder(ctx context.Context, folderName st
 	return files, nil
 }
 
+// GetFolderSize returns the total size of all files in a folder.
+func (f *FilesystemAdapter) GetFolderSize(ctx context.Context, folderName string) (int64, error) {
+	path := filepath.Join(f.rootPath, folderName)
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	var total int64
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			total += info.Size()
+		}
+	}
+	return total, nil
+}
+
 // CreateDownloadURL returns empty string as filesystem doesn't support signed URLs.
 func (f *FilesystemAdapter) CreateDownloadURL(ctx context.Context, objectName string, expiry time.Duration) (string, error) {
 	return "", nil

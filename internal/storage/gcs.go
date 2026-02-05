@@ -154,6 +154,26 @@ func (g *GCSAdapter) ListFilesInFolder(ctx context.Context, folderName string) (
 	return files, nil
 }
 
+// GetFolderSize returns the total size of all files in a folder.
+func (g *GCSAdapter) GetFolderSize(ctx context.Context, folderName string) (int64, error) {
+	prefix := g.fullKey(folderName) + "/"
+
+	var total int64
+	it := g.client.Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += attrs.Size
+	}
+
+	return total, nil
+}
+
 // CreateDownloadURL creates a signed URL for downloading.
 func (g *GCSAdapter) CreateDownloadURL(ctx context.Context, objectName string, expiry time.Duration) (string, error) {
 	url, err := g.client.Bucket(g.bucket).SignedURL(g.fullKey(objectName), &storage.SignedURLOptions{
