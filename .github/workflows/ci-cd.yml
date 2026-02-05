@@ -49,50 +49,82 @@ jobs:
           BENCH_BUFFER_SIZES_KB: '64,256'
         run: go test ./... -bench . -benchmem -run ^$ -benchtime=1x
 
-  deploy:
+  deploy-build:
     if: github.event_name == 'push'
-    name: 🚀 Build and push
+    name: 🚀 Build (${{ matrix.suffix }})
     permissions:
       packages: write
       contents: read
     needs: [lint, test-unit, benchmark]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute branch tag
-        id: branch-tag
-        shell: bash
-        run: |
-          branch_tag="${GITHUB_REF_NAME//\//_}"
-          echo "tag=${branch_tag}" >> "$GITHUB_OUTPUT"
-
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=${{ steps.branch-tag.outputs.tag }}
-
-      - name: Login to GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Upload digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.suffix }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  deploy-merge:
+    if: github.event_name == 'push'
+    name: 🚀 Create manifest
+    permissions:
+      packages: write
+      contents: read
+    needs: [deploy-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Create manifest list and push
+        run: |
+          docker buildx imagetools create -t "ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME//\//_}" \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' /tmp/digests/*)
