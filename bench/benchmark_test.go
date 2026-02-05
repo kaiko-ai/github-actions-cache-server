@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,8 @@ var (
 	defaultFileSizesMB   = []int{100, 500}
 	defaultBufferSizesKB = []int{64, 128, 256, 512, 1024}
 )
+
+var errServerDirMissing = errors.New("cmd/server directory not found")
 
 func BenchmarkCacheServer(b *testing.B) {
 	fileSizes := parseEnvIntList(b, "BENCH_FILE_SIZES_MB", defaultFileSizesMB)
@@ -272,6 +275,12 @@ func buildServerBinary(b testing.TB) string {
 	b.Helper()
 
 	serverBuildOnce.Do(func() {
+		root := repoRoot()
+		if !hasServerDir(root) {
+			serverBuildErr = fmt.Errorf("%w under %s", errServerDirMissing, root)
+			return
+		}
+
 		tempDir, err := os.MkdirTemp("", "cache-server-bench-*")
 		if err != nil {
 			serverBuildErr = err
@@ -281,7 +290,7 @@ func buildServerBinary(b testing.TB) string {
 		serverBinary = filepath.Join(tempDir, "cache-server")
 
 		cmd := exec.Command("go", "build", "-o", serverBinary, "./cmd/server")
-		cmd.Dir = repoRoot()
+		cmd.Dir = root
 		cmd.Stdout = io.Discard
 		cmd.Stderr = os.Stderr
 
@@ -289,6 +298,9 @@ func buildServerBinary(b testing.TB) string {
 	})
 
 	if serverBuildErr != nil {
+		if errors.Is(serverBuildErr, errServerDirMissing) {
+			b.Skipf("skipping benchmarks: %v", serverBuildErr)
+		}
 		b.Fatalf("failed to build server: %v", serverBuildErr)
 	}
 
@@ -296,21 +308,58 @@ func buildServerBinary(b testing.TB) string {
 }
 
 func repoRoot() string {
-	if root, err := moduleRoot(); err == nil && root != "" {
-		return root
+	candidates := []string{}
+
+	if workspace := strings.TrimSpace(os.Getenv("GITHUB_WORKSPACE")); workspace != "" {
+		candidates = append(candidates, workspace)
+	}
+
+	if gomod := strings.TrimSpace(os.Getenv("GOMOD")); gomod != "" && gomod != os.DevNull {
+		candidates = append(candidates, filepath.Dir(gomod))
+	}
+
+	if root, err := moduleRootFromGoEnv(); err == nil && root != "" {
+		candidates = append(candidates, root)
+	}
+
+	if root, err := moduleRootFromGoList(); err == nil && root != "" {
+		candidates = append(candidates, root)
 	}
 
 	wd, err := os.Getwd()
 	if err != nil {
 		return "."
 	}
+	candidates = append(candidates, wd)
 	if filepath.Base(wd) == "bench" {
-		return filepath.Dir(wd)
+		candidates = append(candidates, filepath.Dir(wd))
 	}
+
+	for _, candidate := range candidates {
+		if hasServerDir(candidate) {
+			return candidate
+		}
+	}
+
 	return wd
 }
 
-func moduleRoot() (string, error) {
+func moduleRootFromGoEnv() (string, error) {
+	cmd := exec.Command("go", "env", "GOMOD")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("go env GOMOD: %w", err)
+	}
+
+	gomod := strings.TrimSpace(string(output))
+	if gomod == "" || gomod == os.DevNull {
+		return "", fmt.Errorf("GOMOD is empty")
+	}
+
+	return filepath.Dir(gomod), nil
+}
+
+func moduleRootFromGoList() (string, error) {
 	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -322,6 +371,17 @@ func moduleRoot() (string, error) {
 		return "", fmt.Errorf("module root is empty")
 	}
 	return root, nil
+}
+
+func hasServerDir(root string) bool {
+	if root == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(root, "cmd", "server"))
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
 }
 
 func startServer(b testing.TB, binary string, bufferBytes int) (string, func()) {
