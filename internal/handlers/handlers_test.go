@@ -1,9 +1,21 @@
 package handlers
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/falcosecurity/github-actions-cache-server/internal/config"
+	"github.com/falcosecurity/github-actions-cache-server/internal/db"
+	"github.com/falcosecurity/github-actions-cache-server/internal/storage"
 )
 
 func TestGetChunkIndexFromBlockID_64Byte(t *testing.T) {
@@ -129,4 +141,213 @@ func (m *mockReader) Read(p []byte) (int, error) {
 	n := copy(p, m.data[m.offset:])
 	m.offset += n
 	return n, nil
+}
+
+// setupTestHandler creates a Handler with test dependencies (in-memory SQLite and temp directory storage).
+func setupTestHandler(t *testing.T) *Handler {
+	t.Helper()
+
+	// Create temp directory for storage
+	tmpDir, err := os.MkdirTemp("", "handler-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+
+	// Create filesystem storage adapter
+	storageAdapter, err := storage.NewFilesystemAdapter(tmpDir, 1024*1024)
+	if err != nil {
+		t.Fatalf("failed to create storage adapter: %v", err)
+	}
+
+	// Create in-memory SQLite database
+	cfg := &config.Config{
+		DBDriver:     "sqlite",
+		DBSqlitePath: ":memory:",
+	}
+	database, err := db.New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create database: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	// Run migrations
+	if err := database.Migrate(context.Background()); err != nil {
+		t.Fatalf("failed to run migrations: %v", err)
+	}
+
+	// Create handler
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(cfg, database, storageAdapter, logger)
+}
+
+// createTestUpload creates an upload record in the database.
+func createTestUpload(t *testing.T, h *Handler, key, version, folderName string) *db.Upload {
+	t.Helper()
+
+	upload := &db.Upload{
+		ID:         generateNumberID(),
+		Key:        key,
+		Version:    version,
+		FolderName: folderName,
+		CreatedAt:  time.Now().Unix(),
+	}
+
+	if err := h.db.CreateUpload(context.Background(), upload); err != nil {
+		t.Fatalf("failed to create upload: %v", err)
+	}
+
+	return upload
+}
+
+// createTestPart creates a part file in storage.
+func createTestPart(t *testing.T, h *Handler, folderName string, index int) {
+	t.Helper()
+
+	partName := folderName + "/parts/part" + string(rune('0'+index))
+	data := []byte("test part data")
+	if err := h.storage.UploadStream(context.Background(), partName, bytes.NewReader(data)); err != nil {
+		t.Fatalf("failed to create test part: %v", err)
+	}
+}
+
+func TestFinalizeCacheEntryUpload_StringSizeBytes(t *testing.T) {
+	h := setupTestHandler(t)
+
+	// Create an upload first
+	upload := createTestUpload(t, h, "test-key", "test-version", "folder-string")
+
+	// Create a test part file
+	createTestPart(t, h, upload.FolderName, 0)
+
+	// Test: Send finalize request with size_bytes as STRING (GitHub toolkit behavior)
+	body := `{"key": "test-key", "version": "test-version", "size_bytes": "1048576"}`
+	req := httptest.NewRequest(http.MethodPost, "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	h.handleFinalizeCacheEntryUpload(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestFinalizeCacheEntryUpload_NumericSizeBytes(t *testing.T) {
+	h := setupTestHandler(t)
+
+	// Create an upload first
+	upload := createTestUpload(t, h, "test-key", "test-version", "folder-numeric")
+
+	// Create a test part file
+	createTestPart(t, h, upload.FolderName, 0)
+
+	// Test: Send finalize request with size_bytes as NUMBER
+	body := `{"key": "test-key", "version": "test-version", "size_bytes": 1048576}`
+	req := httptest.NewRequest(http.MethodPost, "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	h.handleFinalizeCacheEntryUpload(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestFinalizeCacheEntryUpload_MissingSizeBytes(t *testing.T) {
+	h := setupTestHandler(t)
+
+	// Create an upload first
+	upload := createTestUpload(t, h, "test-key", "test-version", "folder-missing")
+
+	// Create a test part file
+	createTestPart(t, h, upload.FolderName, 0)
+
+	// Test: Send finalize request without size_bytes field
+	body := `{"key": "test-key", "version": "test-version"}`
+	req := httptest.NewRequest(http.MethodPost, "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	h.handleFinalizeCacheEntryUpload(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestFinalizeCacheEntryUpload_UploadNotFound(t *testing.T) {
+	h := setupTestHandler(t)
+
+	// Test: Send finalize request for non-existent upload
+	body := `{"key": "nonexistent-key", "version": "nonexistent-version"}`
+	req := httptest.NewRequest(http.MethodPost, "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	h.handleFinalizeCacheEntryUpload(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestResponseWriter_CapturesStatusCode(t *testing.T) {
+	// Test that our responseWriter wrapper correctly captures status codes
+	tests := []struct {
+		name     string
+		status   int
+		expected int
+	}{
+		{"OK", http.StatusOK, http.StatusOK},
+		{"BadRequest", http.StatusBadRequest, http.StatusBadRequest},
+		{"NotFound", http.StatusNotFound, http.StatusNotFound},
+		{"InternalServerError", http.StatusInternalServerError, http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			rw := &responseWriter{ResponseWriter: rr, status: http.StatusOK}
+
+			rw.WriteHeader(tt.status)
+
+			if rw.status != tt.expected {
+				t.Errorf("expected status %d, got %d", tt.expected, rw.status)
+			}
+			if rr.Code != tt.expected {
+				t.Errorf("expected underlying recorder status %d, got %d", tt.expected, rr.Code)
+			}
+		})
+	}
+}
+
+func TestRequestLogger_LogsRequests(t *testing.T) {
+	h := setupTestHandler(t)
+	router := h.Router()
+
+	// Test health endpoint (should return 200)
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rr.Code)
+	}
+}
+
+func TestRequestLogger_LogsErrorResponses(t *testing.T) {
+	h := setupTestHandler(t)
+	router := h.Router()
+
+	// Test finalize with invalid body (should return 400 and log error)
+	req := httptest.NewRequest(http.MethodPost, "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", strings.NewReader("invalid json"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d: %s", rr.Code, rr.Body.String())
+	}
 }

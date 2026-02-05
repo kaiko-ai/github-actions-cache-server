@@ -49,9 +49,32 @@ func New(cfg *config.Config, database *db.DB, storageAdapter storage.Adapter, lo
 	}
 }
 
+// responseWriter wraps http.ResponseWriter to capture the status code.
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// requestLogger is a middleware that logs incoming HTTP requests.
+func (h *Handler) requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rw, r)
+		h.logger.Info("request", "method", r.Method, "path", r.URL.Path, "status", rw.status)
+	})
+}
+
 // Router returns a configured chi router with all routes.
 func (h *Handler) Router() http.Handler {
 	r := chi.NewRouter()
+
+	// Add request logging middleware
+	r.Use(h.requestLogger)
 
 	// Utility routes
 	r.Get("/", h.handleRoot)
@@ -286,9 +309,9 @@ func (h *Handler) findCacheEntry(ctx context.Context, keys []string, version str
 
 // FinalizeCacheEntryUpload request/response types.
 type FinalizeCacheEntryUploadRequest struct {
-	Key       *string `json:"key"`
-	Version   *string `json:"version"`
-	SizeBytes int64   `json:"size_bytes,omitempty"`
+	Key       *string     `json:"key"`
+	Version   *string     `json:"version"`
+	SizeBytes json.Number `json:"size_bytes,omitempty"`
 }
 
 type FinalizeCacheEntryUploadResponse struct {
@@ -741,17 +764,18 @@ func (c *countingReader) Read(p []byte) (int, error) {
 }
 
 // writeJSON writes a JSON response.
-func (h *Handler) writeJSON(w http.ResponseWriter, status int, v interface{}) {
+func (h *Handler) writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
 }
 
-// writeJSONError writes a JSON error response.
+// writeJSONError writes a JSON error response and logs the error.
 func (h *Handler) writeJSONError(w http.ResponseWriter, status int, message string) {
+	h.logger.Warn("error response", "status", status, "message", message)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"statusCode":    status,
 		"statusMessage": message,
 	})
