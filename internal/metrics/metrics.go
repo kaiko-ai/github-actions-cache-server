@@ -39,6 +39,19 @@ type Metrics struct {
 	DBQueryDuration metric.Float64Histogram
 	DBQueriesTotal  metric.Int64Counter
 
+	// Error metrics
+	ErrorsTotal metric.Int64Counter
+
+	// Cleanup metrics
+	CleanupOpsTotal   metric.Int64Counter
+	CleanupDuration   metric.Float64Histogram
+	CleanupItemsTotal metric.Int64Counter
+
+	// Merge metrics
+	MergeOpsTotal   metric.Int64Counter
+	MergeDuration   metric.Float64Histogram
+	MergeBytesTotal metric.Int64Counter
+
 	meter  metric.Meter
 	tracer trace.Tracer
 }
@@ -197,6 +210,68 @@ func newMetrics() (*Metrics, error) {
 	m.DBQueriesTotal, err = meter.Int64Counter(
 		"db_queries_total",
 		metric.WithDescription("Total database queries"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Error metrics
+	m.ErrorsTotal, err = meter.Int64Counter(
+		"errors_total",
+		metric.WithDescription("Total errors by endpoint, type, and status code"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cleanup metrics
+	m.CleanupOpsTotal, err = meter.Int64Counter(
+		"cleanup_operations_total",
+		metric.WithDescription("Total cleanup operations"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	m.CleanupDuration, err = meter.Float64Histogram(
+		"cleanup_duration_seconds",
+		metric.WithDescription("Cleanup operation duration in seconds"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	m.CleanupItemsTotal, err = meter.Int64Counter(
+		"cleanup_items_total",
+		metric.WithDescription("Total items processed during cleanup"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Merge metrics
+	m.MergeOpsTotal, err = meter.Int64Counter(
+		"merge_operations_total",
+		metric.WithDescription("Total merge operations"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	m.MergeDuration, err = meter.Float64Histogram(
+		"merge_duration_seconds",
+		metric.WithDescription("Merge operation duration in seconds"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	m.MergeBytesTotal, err = meter.Int64Counter(
+		"merge_bytes_written_total",
+		metric.WithDescription("Total bytes written during merge operations"),
+		metric.WithUnit("By"),
 	)
 	if err != nil {
 		return nil, err
@@ -370,5 +445,64 @@ func getStatusClass(status int) string {
 		return "2xx"
 	default:
 		return "1xx"
+	}
+}
+
+// RecordError records an error occurrence.
+func (m *Metrics) RecordError(ctx context.Context, endpoint, errorType string, statusCode int) {
+	if m == nil {
+		return
+	}
+
+	m.ErrorsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("endpoint", normalizeRoute(endpoint)),
+		attribute.String("error_type", errorType),
+		attribute.Int("status_code", statusCode),
+	))
+}
+
+// RecordCleanupOperation records a cleanup operation.
+func (m *Metrics) RecordCleanupOperation(ctx context.Context, operation, status string, duration time.Duration, itemsProcessed, itemsDeleted int64) {
+	if m == nil {
+		return
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("operation", operation),
+		attribute.String("status", status),
+	}
+
+	m.CleanupOpsTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
+	m.CleanupDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
+
+	if itemsProcessed > 0 {
+		m.CleanupItemsTotal.Add(ctx, itemsProcessed, metric.WithAttributes(
+			attribute.String("operation", operation),
+			attribute.String("type", "processed"),
+		))
+	}
+	if itemsDeleted > 0 {
+		m.CleanupItemsTotal.Add(ctx, itemsDeleted, metric.WithAttributes(
+			attribute.String("operation", operation),
+			attribute.String("type", "deleted"),
+		))
+	}
+}
+
+// RecordMergeOperation records a merge operation.
+func (m *Metrics) RecordMergeOperation(ctx context.Context, status string, duration time.Duration, bytesWritten int64) {
+	if m == nil {
+		return
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("status", status),
+	}
+
+	m.MergeOpsTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
+	m.MergeDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
+
+	if bytesWritten > 0 {
+		m.MergeBytesTotal.Add(ctx, bytesWritten, metric.WithAttributes(attrs...))
 	}
 }

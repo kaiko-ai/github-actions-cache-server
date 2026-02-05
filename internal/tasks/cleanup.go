@@ -10,6 +10,7 @@ import (
 
 	"github.com/falcosecurity/github-actions-cache-server/internal/config"
 	"github.com/falcosecurity/github-actions-cache-server/internal/db"
+	"github.com/falcosecurity/github-actions-cache-server/internal/metrics"
 	"github.com/falcosecurity/github-actions-cache-server/internal/storage"
 )
 
@@ -81,24 +82,37 @@ func (s *Scheduler) Stop() {
 	s.cron.Stop()
 }
 
+// recordCleanup records cleanup operation metrics.
+func (s *Scheduler) recordCleanup(ctx context.Context, operation, status string, start time.Time, processed, deleted int64) {
+	if m := metrics.Get(); m != nil {
+		m.RecordCleanupOperation(ctx, operation, status, time.Since(start), processed, deleted)
+	}
+}
+
 // cleanupUploads deletes stale uploads.
 func (s *Scheduler) cleanupUploads() {
 	ctx := context.Background()
+	start := time.Now()
 	s.logger.Debug("running uploads cleanup")
 
-	totalDeleted := 0
+	totalProcessed := int64(0)
+	totalDeleted := int64(0)
 	threshold := time.Now().Add(-uploadTimeout).UnixMilli()
+	status := "success"
 
 	for {
 		uploads, err := s.db.GetStaleUploads(ctx, threshold, cleanupPageSize)
 		if err != nil {
 			s.logger.Error("failed to get stale uploads", "error", err)
-			return
+			status = "failure"
+			break
 		}
 
 		if len(uploads) == 0 {
 			break
 		}
+
+		totalProcessed += int64(len(uploads))
 
 		for _, upload := range uploads {
 			// Delete storage folder
@@ -117,6 +131,8 @@ func (s *Scheduler) cleanupUploads() {
 		}
 	}
 
+	s.recordCleanup(ctx, "uploads", status, start, totalProcessed, totalDeleted)
+
 	if totalDeleted > 0 {
 		s.logger.Info("uploads cleanup completed", "deleted", totalDeleted)
 	}
@@ -125,21 +141,27 @@ func (s *Scheduler) cleanupUploads() {
 // cleanupCacheEntries deletes old cache entries.
 func (s *Scheduler) cleanupCacheEntries() {
 	ctx := context.Background()
+	start := time.Now()
 	s.logger.Debug("running cache entries cleanup")
 
-	totalDeleted := 0
+	totalProcessed := int64(0)
+	totalDeleted := int64(0)
 	threshold := time.Now().AddDate(0, 0, -s.config.CacheCleanupOlderThanDays).UnixMilli()
+	status := "success"
 
 	for {
 		locations, err := s.db.GetOldCacheEntries(ctx, threshold, cleanupPageSize)
 		if err != nil {
 			s.logger.Error("failed to get old cache entries", "error", err)
-			return
+			status = "failure"
+			break
 		}
 
 		if len(locations) == 0 {
 			break
 		}
+
+		totalProcessed += int64(len(locations))
 
 		for _, loc := range locations {
 			// Delete storage folder
@@ -164,6 +186,8 @@ func (s *Scheduler) cleanupCacheEntries() {
 		}
 	}
 
+	s.recordCleanup(ctx, "cache_entries", status, start, totalProcessed, totalDeleted)
+
 	if totalDeleted > 0 {
 		s.logger.Info("cache entries cleanup completed", "deleted", totalDeleted)
 	}
@@ -172,20 +196,26 @@ func (s *Scheduler) cleanupCacheEntries() {
 // cleanupStorageLocations deletes orphaned storage locations.
 func (s *Scheduler) cleanupStorageLocations() {
 	ctx := context.Background()
+	start := time.Now()
 	s.logger.Debug("running storage locations cleanup")
 
-	totalDeleted := 0
+	totalProcessed := int64(0)
+	totalDeleted := int64(0)
+	status := "success"
 
 	for {
 		locations, err := s.db.GetOrphanedStorageLocations(ctx, cleanupPageSize)
 		if err != nil {
 			s.logger.Error("failed to get orphaned storage locations", "error", err)
-			return
+			status = "failure"
+			break
 		}
 
 		if len(locations) == 0 {
 			break
 		}
+
+		totalProcessed += int64(len(locations))
 
 		for _, loc := range locations {
 			// Delete storage folder
@@ -204,6 +234,8 @@ func (s *Scheduler) cleanupStorageLocations() {
 		}
 	}
 
+	s.recordCleanup(ctx, "storage_locations", status, start, totalProcessed, totalDeleted)
+
 	if totalDeleted > 0 {
 		s.logger.Info("storage locations cleanup completed", "deleted", totalDeleted)
 	}
@@ -212,21 +244,27 @@ func (s *Scheduler) cleanupStorageLocations() {
 // cleanupParts deletes parts for merged cache entries.
 func (s *Scheduler) cleanupParts() {
 	ctx := context.Background()
+	start := time.Now()
 	s.logger.Debug("running parts cleanup")
 
-	totalDeleted := 0
+	totalProcessed := int64(0)
+	totalDeleted := int64(0)
 	now := time.Now().UnixMilli()
+	status := "success"
 
 	for {
 		locations, err := s.db.GetMergedStorageLocationsForPartsCleanup(ctx, cleanupPageSize)
 		if err != nil {
 			s.logger.Error("failed to get merged storage locations", "error", err)
-			return
+			status = "failure"
+			break
 		}
 
 		if len(locations) == 0 {
 			break
 		}
+
+		totalProcessed += int64(len(locations))
 
 		for _, loc := range locations {
 			// Delete parts folder
@@ -242,9 +280,11 @@ func (s *Scheduler) cleanupParts() {
 				continue
 			}
 
-			totalDeleted += loc.PartCount
+			totalDeleted += int64(loc.PartCount)
 		}
 	}
+
+	s.recordCleanup(ctx, "parts", status, start, totalProcessed, totalDeleted)
 
 	if totalDeleted > 0 {
 		s.logger.Info("parts cleanup completed", "deleted", totalDeleted)
@@ -254,15 +294,21 @@ func (s *Scheduler) cleanupParts() {
 // cleanupMerges resets stalled merges.
 func (s *Scheduler) cleanupMerges() {
 	ctx := context.Background()
+	start := time.Now()
 	s.logger.Debug("running merges cleanup")
 
 	threshold := time.Now().Add(-mergeTimeout).UnixMilli()
+	status := "success"
 
 	updated, err := s.db.GetStaleMerges(ctx, threshold)
 	if err != nil {
 		s.logger.Error("failed to reset stale merges", "error", err)
+		status = "failure"
+		s.recordCleanup(ctx, "merges", status, start, 0, 0)
 		return
 	}
+
+	s.recordCleanup(ctx, "merges", status, start, int64(updated), int64(updated))
 
 	if updated > 0 {
 		s.logger.Info("merges cleanup completed", "updated", updated)

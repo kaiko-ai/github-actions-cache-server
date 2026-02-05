@@ -111,7 +111,9 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleMetrics returns Prometheus-formatted metrics.
 func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if !h.config.MetricsEnabled {
+		h.recordError(ctx, r.URL.Path, "disabled", http.StatusNotFound)
 		h.writeJSONError(w, http.StatusNotFound, "Metrics endpoint is disabled")
 		return
 	}
@@ -120,6 +122,7 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if handler != nil {
 		handler.ServeHTTP(w, r)
 	} else {
+		h.recordError(ctx, r.URL.Path, "not_initialized", http.StatusServiceUnavailable)
 		h.writeJSONError(w, http.StatusServiceUnavailable, "Metrics not initialized")
 	}
 }
@@ -140,11 +143,12 @@ func (h *Handler) handleCreateCacheEntry(w http.ResponseWriter, r *http.Request)
 
 	var req CreateCacheEntryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.recordError(ctx, r.URL.Path, "invalid_request", http.StatusBadRequest)
 		h.writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if !h.validateKeyVersion(w, req.Key, req.Version) {
+	if !h.validateKeyVersion(w, r, req.Key, req.Version) {
 		return
 	}
 
@@ -155,6 +159,7 @@ func (h *Handler) handleCreateCacheEntry(w http.ResponseWriter, r *http.Request)
 	existingUpload, err := h.db.GetUploadByKeyVersion(ctx, key, version)
 	if err != nil {
 		h.logger.Error("failed to check existing upload", "error", err)
+		h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
@@ -179,6 +184,7 @@ func (h *Handler) handleCreateCacheEntry(w http.ResponseWriter, r *http.Request)
 
 	if err := h.db.CreateUpload(ctx, upload); err != nil {
 		h.logger.Error("failed to create upload", "error", err)
+		h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
@@ -213,11 +219,12 @@ func (h *Handler) handleGetCacheEntryDownloadURL(w http.ResponseWriter, r *http.
 
 	var req GetCacheEntryDownloadURLRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.recordError(ctx, r.URL.Path, "invalid_request", http.StatusBadRequest)
 		h.writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if !h.validateKeyVersion(w, req.Key, req.Version) {
+	if !h.validateKeyVersion(w, r, req.Key, req.Version) {
 		return
 	}
 
@@ -234,6 +241,7 @@ func (h *Handler) handleGetCacheEntryDownloadURL(w http.ResponseWriter, r *http.
 	entry, err := h.findCacheEntry(ctx, keys, version)
 	if err != nil {
 		h.logger.Error("failed to find cache entry", "error", err)
+		h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
@@ -253,6 +261,7 @@ func (h *Handler) handleGetCacheEntryDownloadURL(w http.ResponseWriter, r *http.
 		loc, err := h.db.GetStorageLocation(ctx, entry.LocationID)
 		if err != nil {
 			h.logger.Error("failed to get storage location", "error", err)
+			h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 			h.writeJSONError(w, http.StatusInternalServerError, "database error")
 			return
 		}
@@ -325,11 +334,12 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 
 	var req FinalizeCacheEntryUploadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.recordError(ctx, r.URL.Path, "invalid_request", http.StatusBadRequest)
 		h.writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if !h.validateKeyVersion(w, req.Key, req.Version) {
+	if !h.validateKeyVersion(w, r, req.Key, req.Version) {
 		return
 	}
 
@@ -340,11 +350,13 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 	upload, err := h.db.GetUploadByKeyVersion(ctx, key, version)
 	if err != nil {
 		h.logger.Error("failed to get upload", "error", err)
+		h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
 	if upload == nil {
+		h.recordError(ctx, r.URL.Path, "not_found", http.StatusNotFound)
 		h.writeJSONError(w, http.StatusNotFound, "Upload not found")
 		return
 	}
@@ -354,10 +366,12 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 	partCount, err := h.storage.CountFilesInFolder(ctx, partsFolder)
 	if err != nil {
 		h.logger.Error("failed to count parts", "error", err)
+		h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "storage error")
 		return
 	}
 	if partCount == 0 {
+		h.recordError(ctx, r.URL.Path, "no_parts", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "No parts found for upload")
 		return
 	}
@@ -384,6 +398,7 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 	result, err := h.db.CompleteUpload(ctx, upload.ID, cacheEntry, storageLocation)
 	if err != nil {
 		h.logger.Error("failed to complete upload", "error", err)
+		h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
@@ -411,6 +426,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	uploadIDStr := chi.URLParam(r, "uploadId")
 	uploadID, err := strconv.ParseInt(uploadIDStr, 10, 64)
 	if err != nil {
+		h.recordError(ctx, r.URL.Path, "invalid_request", http.StatusBadRequest)
 		h.writeJSONError(w, http.StatusBadRequest, "invalid upload ID")
 		return
 	}
@@ -426,6 +442,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	upload, err := h.db.GetUpload(ctx, uploadID)
 	if err != nil {
 		h.logger.Error("failed to get upload", "error", err)
+		h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
@@ -444,6 +461,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		index, err := getChunkIndexFromBlockID(blockIDBase64)
 		if err != nil {
 			// Invalid blockid - return 400 Bad Request
+			h.recordError(ctx, r.URL.Path, "invalid_request", http.StatusBadRequest)
 			h.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid block id: %s", blockIDBase64))
 			return
 		}
@@ -458,6 +476,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.storage.UploadStream(ctx, objectName, countingReader); err != nil {
 		h.logger.Error("failed to upload chunk", "error", err)
+		h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "storage error")
 		return
 	}
@@ -483,6 +502,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 // handleDownload handles cache downloads with merge-on-demand.
 func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	downloadStart := time.Now()
 
 	cacheEntryID := chi.URLParam(r, "cacheEntryId")
 
@@ -490,11 +510,13 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	entry, err := h.db.GetCacheEntry(ctx, cacheEntryID)
 	if err != nil {
 		h.logger.Error("failed to get cache entry", "error", err)
+		h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
 	if entry == nil {
+		h.recordError(ctx, r.URL.Path, "not_found", http.StatusNotFound)
 		h.writeJSONError(w, http.StatusNotFound, "cache entry not found")
 		return
 	}
@@ -503,11 +525,13 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	loc, err := h.db.GetStorageLocation(ctx, entry.LocationID)
 	if err != nil {
 		h.logger.Error("failed to get storage location", "error", err)
+		h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
 	if loc == nil {
+		h.recordError(ctx, r.URL.Path, "not_found", http.StatusNotFound)
 		h.writeJSONError(w, http.StatusNotFound, "storage location not found")
 		return
 	}
@@ -526,6 +550,7 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		reader, err := h.storage.CreateDownloadStream(ctx, fmt.Sprintf("%s/merged", loc.FolderName))
 		if err != nil {
 			h.logger.Error("failed to open merged file", "error", err)
+			h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
 			h.writeJSONError(w, http.StatusInternalServerError, "storage error")
 			return
 		}
@@ -556,7 +581,7 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// Record metrics
 	if m := metrics.Get(); m != nil {
-		m.RecordStorageOperation(ctx, "download", h.config.StorageDriver, 0)
+		m.RecordStorageOperation(ctx, "download", h.config.StorageDriver, time.Since(downloadStart))
 		m.RecordBytesDownloaded(ctx, totalBytes, "download", h.config.StorageDriver, "/download/:cacheEntryId")
 	}
 }
@@ -604,12 +629,15 @@ func (h *Handler) streamParts(ctx context.Context, w io.Writer, folderName strin
 // mergeInBackground merges parts into a single file.
 func (h *Handler) mergeInBackground(locationID, folderName string) {
 	ctx := context.Background()
+	mergeStart := time.Now()
+	var bytesWritten int64
 
 	// List part files
 	partsFolder := fmt.Sprintf("%s/parts", folderName)
 	files, err := h.storage.ListFilesInFolder(ctx, partsFolder)
 	if err != nil {
 		h.logger.Error("failed to list parts for merge", "error", err)
+		h.recordMergeResult(ctx, "failure", mergeStart, 0)
 		h.resetMergeState(ctx, locationID)
 		return
 	}
@@ -629,7 +657,8 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 	// Create a pipe to stream merged content
 	pr, pw := io.Pipe()
 
-	// Write parts to pipe in goroutine
+	// Write parts to pipe in goroutine and track bytes
+	var pipeErr error
 	go func() {
 		defer pw.Close()
 		for _, idx := range indices {
@@ -637,15 +666,18 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 			reader, err := h.storage.CreateDownloadStream(ctx, objectName)
 			if err != nil {
 				h.logger.Error("failed to open part for merge", "error", err, "part", idx)
+				pipeErr = err
 				pw.CloseWithError(err)
 				return
 			}
 
-			_, err = io.Copy(pw, reader)
+			n, err := io.Copy(pw, reader)
 			reader.Close()
+			bytesWritten += n
 
 			if err != nil {
 				h.logger.Error("failed to copy part for merge", "error", err, "part", idx)
+				pipeErr = err
 				pw.CloseWithError(err)
 				return
 			}
@@ -656,6 +688,14 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 	objectName := fmt.Sprintf("%s/merged", folderName)
 	if err := h.storage.UploadStream(ctx, objectName, pr); err != nil {
 		h.logger.Error("failed to upload merged file", "error", err)
+		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
+		h.resetMergeState(ctx, locationID)
+		return
+	}
+
+	// Check if pipe had an error
+	if pipeErr != nil {
+		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
 		h.resetMergeState(ctx, locationID)
 		return
 	}
@@ -664,6 +704,7 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 	now := time.Now().UnixMilli()
 	if err := h.db.UpdateStorageLocationMerged(ctx, locationID, now); err != nil {
 		h.logger.Error("failed to mark as merged", "error", err)
+		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
 		h.resetMergeState(ctx, locationID)
 		return
 	}
@@ -671,23 +712,28 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 	// Delete parts folder and mark parts deleted
 	if err := h.storage.DeleteFolder(ctx, partsFolder); err != nil {
 		h.logger.Error("failed to delete parts folder", "error", err, "locationId", locationID)
+		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
 		h.resetMergeState(ctx, locationID)
 		return
 	}
 	if err := h.db.UpdateStorageLocationPartsDeleted(ctx, locationID, now); err != nil {
 		h.logger.Error("failed to mark parts deleted", "error", err, "locationId", locationID)
+		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
 		h.resetMergeState(ctx, locationID)
 		return
 	}
 
-	h.logger.Info("merged cache entry", "locationId", locationID, "parts", len(indices))
+	h.recordMergeResult(ctx, "success", mergeStart, bytesWritten)
+	h.logger.Info("merged cache entry", "locationId", locationID, "parts", len(indices), "bytes", bytesWritten)
 }
 
 // handleCatchAllProxy proxies unknown requests to GitHub results receiver.
 func (h *Handler) handleCatchAllProxy(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	targetURL, err := url.Parse(githubResultsReceiver)
 	if err != nil {
 		h.logger.Error("failed to parse proxy target URL", "error", err)
+		h.recordError(ctx, r.URL.Path, "proxy_config_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "proxy configuration error")
 		return
 	}
@@ -704,6 +750,7 @@ func (h *Handler) handleCatchAllProxy(w http.ResponseWriter, r *http.Request) {
 	// Handle errors
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		h.logger.Error("proxy error", "error", err, "path", r.URL.Path)
+		h.recordError(r.Context(), r.URL.Path, "proxy_error", http.StatusBadGateway)
 		h.writeJSONError(w, http.StatusBadGateway, "proxy error")
 	}
 
@@ -776,8 +823,9 @@ func (n *nullableStringSlice) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (h *Handler) validateKeyVersion(w http.ResponseWriter, key, version *string) bool {
+func (h *Handler) validateKeyVersion(w http.ResponseWriter, r *http.Request, key, version *string) bool {
 	if key == nil || version == nil {
+		h.recordError(r.Context(), r.URL.Path, "invalid_request", http.StatusBadRequest)
 		h.writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return false
 	}
@@ -818,4 +866,18 @@ func (h *Handler) writeJSONError(w http.ResponseWriter, status int, message stri
 		"statusCode":    status,
 		"statusMessage": message,
 	})
+}
+
+// recordError records an error metric.
+func (h *Handler) recordError(ctx context.Context, endpoint, errorType string, statusCode int) {
+	if m := metrics.Get(); m != nil {
+		m.RecordError(ctx, endpoint, errorType, statusCode)
+	}
+}
+
+// recordMergeResult records merge operation metrics.
+func (h *Handler) recordMergeResult(ctx context.Context, status string, start time.Time, bytesWritten int64) {
+	if m := metrics.Get(); m != nil {
+		m.RecordMergeOperation(ctx, status, time.Since(start), bytesWritten)
+	}
 }
