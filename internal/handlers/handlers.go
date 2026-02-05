@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -543,11 +544,11 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Start background merge
-			go h.mergeInBackground(loc.ID, loc.FolderName, loc.PartCount)
+			go h.mergeInBackground(loc.ID, loc.FolderName)
 		}
 
 		// Stream parts to response
-		totalBytes, err = h.streamParts(ctx, w, loc.FolderName, loc.PartCount)
+		totalBytes, err = h.streamParts(ctx, w, loc.FolderName)
 		if err != nil {
 			h.logger.Error("failed to stream parts", "error", err)
 		}
@@ -561,14 +562,31 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 // streamParts streams all parts to a writer.
-func (h *Handler) streamParts(ctx context.Context, w io.Writer, folderName string, partCount int) (int64, error) {
-	var totalBytes int64
+func (h *Handler) streamParts(ctx context.Context, w io.Writer, folderName string) (int64, error) {
+	partsFolder := fmt.Sprintf("%s/parts", folderName)
+	files, err := h.storage.ListFilesInFolder(ctx, partsFolder)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list parts: %w", err)
+	}
 
-	for i := 0; i < partCount; i++ {
-		objectName := fmt.Sprintf("%s/parts/%d", folderName, i)
+	// Parse and sort part indices numerically
+	indices := make([]int, 0, len(files))
+	for _, f := range files {
+		idx, err := strconv.Atoi(f)
+		if err != nil {
+			h.logger.Warn("skipping non-numeric part file", "file", f)
+			continue
+		}
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+
+	var totalBytes int64
+	for _, idx := range indices {
+		objectName := fmt.Sprintf("%s/parts/%d", folderName, idx)
 		reader, err := h.storage.CreateDownloadStream(ctx, objectName)
 		if err != nil {
-			return totalBytes, fmt.Errorf("failed to open part %d: %w", i, err)
+			return totalBytes, fmt.Errorf("failed to open part %d: %w", idx, err)
 		}
 
 		n, err := io.Copy(w, reader)
@@ -576,7 +594,7 @@ func (h *Handler) streamParts(ctx context.Context, w io.Writer, folderName strin
 		totalBytes += n
 
 		if err != nil {
-			return totalBytes, fmt.Errorf("failed to stream part %d: %w", i, err)
+			return totalBytes, fmt.Errorf("failed to stream part %d: %w", idx, err)
 		}
 	}
 
@@ -584,8 +602,29 @@ func (h *Handler) streamParts(ctx context.Context, w io.Writer, folderName strin
 }
 
 // mergeInBackground merges parts into a single file.
-func (h *Handler) mergeInBackground(locationID, folderName string, partCount int) {
+func (h *Handler) mergeInBackground(locationID, folderName string) {
 	ctx := context.Background()
+
+	// List part files
+	partsFolder := fmt.Sprintf("%s/parts", folderName)
+	files, err := h.storage.ListFilesInFolder(ctx, partsFolder)
+	if err != nil {
+		h.logger.Error("failed to list parts for merge", "error", err)
+		h.resetMergeState(ctx, locationID)
+		return
+	}
+
+	// Parse and sort part indices numerically
+	indices := make([]int, 0, len(files))
+	for _, f := range files {
+		idx, err := strconv.Atoi(f)
+		if err != nil {
+			h.logger.Warn("skipping non-numeric part file during merge", "file", f)
+			continue
+		}
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
 
 	// Create a pipe to stream merged content
 	pr, pw := io.Pipe()
@@ -593,11 +632,11 @@ func (h *Handler) mergeInBackground(locationID, folderName string, partCount int
 	// Write parts to pipe in goroutine
 	go func() {
 		defer pw.Close()
-		for i := 0; i < partCount; i++ {
-			objectName := fmt.Sprintf("%s/parts/%d", folderName, i)
+		for _, idx := range indices {
+			objectName := fmt.Sprintf("%s/parts/%d", folderName, idx)
 			reader, err := h.storage.CreateDownloadStream(ctx, objectName)
 			if err != nil {
-				h.logger.Error("failed to open part for merge", "error", err, "part", i)
+				h.logger.Error("failed to open part for merge", "error", err, "part", idx)
 				pw.CloseWithError(err)
 				return
 			}
@@ -606,7 +645,7 @@ func (h *Handler) mergeInBackground(locationID, folderName string, partCount int
 			reader.Close()
 
 			if err != nil {
-				h.logger.Error("failed to copy part for merge", "error", err, "part", i)
+				h.logger.Error("failed to copy part for merge", "error", err, "part", idx)
 				pw.CloseWithError(err)
 				return
 			}
@@ -630,7 +669,7 @@ func (h *Handler) mergeInBackground(locationID, folderName string, partCount int
 	}
 
 	// Delete parts folder and mark parts deleted
-	if err := h.storage.DeleteFolder(ctx, fmt.Sprintf("%s/parts", folderName)); err != nil {
+	if err := h.storage.DeleteFolder(ctx, partsFolder); err != nil {
 		h.logger.Error("failed to delete parts folder", "error", err, "locationId", locationID)
 		h.resetMergeState(ctx, locationID)
 		return
@@ -641,7 +680,7 @@ func (h *Handler) mergeInBackground(locationID, folderName string, partCount int
 		return
 	}
 
-	h.logger.Info("merged cache entry", "locationId", locationID, "parts", partCount)
+	h.logger.Info("merged cache entry", "locationId", locationID, "parts", len(indices))
 }
 
 // handleCatchAllProxy proxies unknown requests to GitHub results receiver.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -349,5 +350,156 @@ func TestRequestLogger_LogsErrorResponses(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected status 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// createTestPartNumeric creates a part file with a numeric name in storage.
+func createTestPartNumeric(t *testing.T, h *Handler, folderName string, index int, data []byte) {
+	t.Helper()
+
+	partName := fmt.Sprintf("%s/parts/%d", folderName, index)
+	if err := h.storage.UploadStream(context.Background(), partName, bytes.NewReader(data)); err != nil {
+		t.Fatalf("failed to create test part: %v", err)
+	}
+}
+
+func TestStreamParts_SequentialIndices(t *testing.T) {
+	h := setupTestHandler(t)
+	ctx := context.Background()
+	folderName := "test-folder-seq"
+
+	// Create parts with sequential 0-based indices
+	part0 := []byte("part0-data")
+	part1 := []byte("part1-data")
+	part2 := []byte("part2-data")
+	createTestPartNumeric(t, h, folderName, 0, part0)
+	createTestPartNumeric(t, h, folderName, 1, part1)
+	createTestPartNumeric(t, h, folderName, 2, part2)
+
+	// Stream parts
+	var buf bytes.Buffer
+	totalBytes, err := h.streamParts(ctx, &buf, folderName)
+	if err != nil {
+		t.Fatalf("streamParts failed: %v", err)
+	}
+
+	expected := append(append(part0, part1...), part2...)
+	if !bytes.Equal(buf.Bytes(), expected) {
+		t.Errorf("streamed data doesn't match: expected %q, got %q", expected, buf.Bytes())
+	}
+	if totalBytes != int64(len(expected)) {
+		t.Errorf("totalBytes doesn't match: expected %d, got %d", len(expected), totalBytes)
+	}
+}
+
+func TestStreamParts_NonSequentialIndices(t *testing.T) {
+	h := setupTestHandler(t)
+	ctx := context.Background()
+	folderName := "test-folder-nonseq"
+
+	// Create parts with 1-based indices (not starting at 0)
+	part1 := []byte("part1-data")
+	part2 := []byte("part2-data")
+	part3 := []byte("part3-data")
+	createTestPartNumeric(t, h, folderName, 1, part1)
+	createTestPartNumeric(t, h, folderName, 2, part2)
+	createTestPartNumeric(t, h, folderName, 3, part3)
+
+	// Stream parts
+	var buf bytes.Buffer
+	totalBytes, err := h.streamParts(ctx, &buf, folderName)
+	if err != nil {
+		t.Fatalf("streamParts failed: %v", err)
+	}
+
+	// Should stream in sorted order: 1, 2, 3
+	expected := append(append(part1, part2...), part3...)
+	if !bytes.Equal(buf.Bytes(), expected) {
+		t.Errorf("streamed data doesn't match: expected %q, got %q", expected, buf.Bytes())
+	}
+	if totalBytes != int64(len(expected)) {
+		t.Errorf("totalBytes doesn't match: expected %d, got %d", len(expected), totalBytes)
+	}
+}
+
+func TestStreamParts_GapsInIndices(t *testing.T) {
+	h := setupTestHandler(t)
+	ctx := context.Background()
+	folderName := "test-folder-gaps"
+
+	// Create parts with gaps in indices (e.g., 0, 2, 5)
+	part0 := []byte("part0-data")
+	part2 := []byte("part2-data")
+	part5 := []byte("part5-data")
+	createTestPartNumeric(t, h, folderName, 0, part0)
+	createTestPartNumeric(t, h, folderName, 2, part2)
+	createTestPartNumeric(t, h, folderName, 5, part5)
+
+	// Stream parts
+	var buf bytes.Buffer
+	totalBytes, err := h.streamParts(ctx, &buf, folderName)
+	if err != nil {
+		t.Fatalf("streamParts failed: %v", err)
+	}
+
+	// Should stream in sorted order: 0, 2, 5
+	expected := append(append(part0, part2...), part5...)
+	if !bytes.Equal(buf.Bytes(), expected) {
+		t.Errorf("streamed data doesn't match: expected %q, got %q", expected, buf.Bytes())
+	}
+	if totalBytes != int64(len(expected)) {
+		t.Errorf("totalBytes doesn't match: expected %d, got %d", len(expected), totalBytes)
+	}
+}
+
+func TestStreamParts_CorrectOrder(t *testing.T) {
+	h := setupTestHandler(t)
+	ctx := context.Background()
+	folderName := "test-folder-order"
+
+	// Create parts in non-sorted order to verify sorting
+	part10 := []byte("part10-data")
+	part2 := []byte("part2-data")
+	part1 := []byte("part1-data")
+	createTestPartNumeric(t, h, folderName, 10, part10)
+	createTestPartNumeric(t, h, folderName, 2, part2)
+	createTestPartNumeric(t, h, folderName, 1, part1)
+
+	// Stream parts
+	var buf bytes.Buffer
+	totalBytes, err := h.streamParts(ctx, &buf, folderName)
+	if err != nil {
+		t.Fatalf("streamParts failed: %v", err)
+	}
+
+	// Should stream in numeric sorted order: 1, 2, 10 (not lexicographic "1", "10", "2")
+	expected := append(append(part1, part2...), part10...)
+	if !bytes.Equal(buf.Bytes(), expected) {
+		t.Errorf("streamed data doesn't match: expected %q, got %q", expected, buf.Bytes())
+	}
+	if totalBytes != int64(len(expected)) {
+		t.Errorf("totalBytes doesn't match: expected %d, got %d", len(expected), totalBytes)
+	}
+}
+
+func TestStreamParts_EmptyFolder(t *testing.T) {
+	h := setupTestHandler(t)
+	ctx := context.Background()
+	folderName := "test-folder-empty"
+
+	// Don't create any parts - folder doesn't exist
+
+	// Stream parts
+	var buf bytes.Buffer
+	totalBytes, err := h.streamParts(ctx, &buf, folderName)
+	if err != nil {
+		t.Fatalf("streamParts failed: %v", err)
+	}
+
+	if buf.Len() != 0 {
+		t.Errorf("expected empty buffer, got %d bytes", buf.Len())
+	}
+	if totalBytes != 0 {
+		t.Errorf("expected 0 totalBytes, got %d", totalBytes)
 	}
 }

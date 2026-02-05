@@ -88,6 +88,26 @@ func (f *FilesystemAdapter) CountFilesInFolder(ctx context.Context, folderName s
 	return count, nil
 }
 
+// ListFilesInFolder lists all files in a folder (non-recursive).
+func (f *FilesystemAdapter) ListFilesInFolder(ctx context.Context, folderName string) ([]string, error) {
+	path := filepath.Join(f.rootPath, folderName)
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var files []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			files = append(files, entry.Name())
+		}
+	}
+	return files, nil
+}
+
 // CreateDownloadURL returns empty string as filesystem doesn't support signed URLs.
 func (f *FilesystemAdapter) CreateDownloadURL(ctx context.Context, objectName string, expiry time.Duration) (string, error) {
 	return "", nil

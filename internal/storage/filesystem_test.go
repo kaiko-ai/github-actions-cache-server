@@ -176,6 +176,150 @@ func TestFilesystemAdapter_CountFilesInNonexistentFolder(t *testing.T) {
 	}
 }
 
+func TestFilesystemAdapter_ListFilesInFolder(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fs-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	adapter, err := NewFilesystemAdapter(tmpDir, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Create some files in a folder with numeric names (like parts)
+	expectedFiles := []string{"0", "1", "2", "3", "4"}
+	for _, name := range expectedFiles {
+		objectName := filepath.Join("parts", name)
+		err := adapter.UploadStream(ctx, objectName, bytes.NewReader([]byte("test")))
+		if err != nil {
+			t.Fatalf("failed to upload: %v", err)
+		}
+	}
+
+	files, err := adapter.ListFilesInFolder(ctx, "parts")
+	if err != nil {
+		t.Fatalf("list files failed: %v", err)
+	}
+
+	if len(files) != 5 {
+		t.Errorf("expected 5 files, got %d", len(files))
+	}
+
+	// Check that all expected files are present (order may vary)
+	fileSet := make(map[string]bool)
+	for _, f := range files {
+		fileSet[f] = true
+	}
+	for _, expected := range expectedFiles {
+		if !fileSet[expected] {
+			t.Errorf("expected file %s not found", expected)
+		}
+	}
+}
+
+func TestFilesystemAdapter_ListFilesInFolder_Empty(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fs-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	adapter, err := NewFilesystemAdapter(tmpDir, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Create empty folder
+	emptyDir := filepath.Join(tmpDir, "emptyparts")
+	if err := os.MkdirAll(emptyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := adapter.ListFilesInFolder(ctx, "emptyparts")
+	if err != nil {
+		t.Fatalf("list files failed: %v", err)
+	}
+
+	if len(files) != 0 {
+		t.Errorf("expected 0 files, got %d", len(files))
+	}
+}
+
+func TestFilesystemAdapter_ListFilesInFolder_Nonexistent(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fs-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	adapter, err := NewFilesystemAdapter(tmpDir, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	files, err := adapter.ListFilesInFolder(ctx, "nonexistent")
+	if err != nil {
+		t.Fatalf("list files failed: %v", err)
+	}
+
+	if files != nil {
+		t.Errorf("expected nil for nonexistent folder, got %v", files)
+	}
+}
+
+func TestFilesystemAdapter_ListFilesInFolder_NonSequential(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fs-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	adapter, err := NewFilesystemAdapter(tmpDir, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Create files with non-sequential indices (1-based or with gaps)
+	nonSequentialFiles := []string{"1", "2", "3", "5", "10"}
+	for _, name := range nonSequentialFiles {
+		objectName := filepath.Join("parts", name)
+		err := adapter.UploadStream(ctx, objectName, bytes.NewReader([]byte("test")))
+		if err != nil {
+			t.Fatalf("failed to upload: %v", err)
+		}
+	}
+
+	files, err := adapter.ListFilesInFolder(ctx, "parts")
+	if err != nil {
+		t.Fatalf("list files failed: %v", err)
+	}
+
+	if len(files) != 5 {
+		t.Errorf("expected 5 files, got %d", len(files))
+	}
+
+	// Check all expected files are present
+	fileSet := make(map[string]bool)
+	for _, f := range files {
+		fileSet[f] = true
+	}
+	for _, expected := range nonSequentialFiles {
+		if !fileSet[expected] {
+			t.Errorf("expected file %s not found", expected)
+		}
+	}
+}
+
 func TestFilesystemAdapter_SignedURL(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "fs-test-*")
 	if err != nil {

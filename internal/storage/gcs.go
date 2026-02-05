@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -127,6 +128,30 @@ func (g *GCSAdapter) CountFilesInFolder(ctx context.Context, folderName string) 
 	}
 
 	return count, nil
+}
+
+// ListFilesInFolder lists all files in a folder (non-recursive).
+func (g *GCSAdapter) ListFilesInFolder(ctx context.Context, folderName string) ([]string, error) {
+	prefix := g.fullKey(folderName) + "/"
+
+	var files []string
+	it := g.client.Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		// Extract filename from full key (remove prefix)
+		name := strings.TrimPrefix(attrs.Name, prefix)
+		if name != "" && !strings.Contains(name, "/") {
+			files = append(files, name)
+		}
+	}
+
+	return files, nil
 }
 
 // CreateDownloadURL creates a signed URL for downloading.

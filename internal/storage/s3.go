@@ -169,6 +169,33 @@ func (s *S3Adapter) CountFilesInFolder(ctx context.Context, folderName string) (
 	return count, nil
 }
 
+// ListFilesInFolder lists all files in a folder (non-recursive).
+func (s *S3Adapter) ListFilesInFolder(ctx context.Context, folderName string) ([]string, error) {
+	prefix := s.fullKey(folderName) + "/"
+
+	var files []string
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range page.Contents {
+			// Extract filename from full key (remove prefix)
+			name := strings.TrimPrefix(*obj.Key, prefix)
+			if name != "" && !strings.Contains(name, "/") {
+				files = append(files, name)
+			}
+		}
+	}
+
+	return files, nil
+}
+
 // CreateDownloadURL creates a presigned URL for downloading.
 func (s *S3Adapter) CreateDownloadURL(ctx context.Context, objectName string, expiry time.Duration) (string, error) {
 	req, err := s.presignClient.PresignGetObject(ctx, &s3.GetObjectInput{

@@ -21,6 +21,9 @@ type Adapter interface {
 	// CountFilesInFolder counts the number of files in a folder.
 	CountFilesInFolder(ctx context.Context, folderName string) (int, error)
 
+	// ListFilesInFolder lists all files in a folder (non-recursive).
+	ListFilesInFolder(ctx context.Context, folderName string) ([]string, error)
+
 	// CreateDownloadURL creates a signed URL for downloading an object (optional).
 	// Returns empty string if not supported.
 	CreateDownloadURL(ctx context.Context, objectName string, expiry time.Duration) (string, error)
