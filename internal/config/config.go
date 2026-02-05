@@ -68,8 +68,8 @@ type Config struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		// Storage defaults
-		StorageDriver:        getEnvOrDefault("STORAGE_DRIVER", "filesystem"),
-		StorageHighWaterMark: getEnvIntOrDefault("STORAGE_HIGH_WATER_MARK", 1048576),
+		StorageDriver:         getEnvOrDefault("STORAGE_DRIVER", "filesystem"),
+		StorageHighWaterMark:  getEnvIntOrDefault("STORAGE_HIGH_WATER_MARK", 1048576),
 		StorageFilesystemPath: getEnvOrDefault("STORAGE_FILESYSTEM_PATH", ".data/storage/filesystem"),
 
 		// S3 defaults

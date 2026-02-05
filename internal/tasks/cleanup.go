@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	cleanupPageSize      = 10
-	uploadTimeout        = 1 * time.Minute
-	mergeTimeout         = 15 * time.Minute
+	cleanupPageSize = 10
+	uploadTimeout   = 1 * time.Minute
+	mergeTimeout    = 15 * time.Minute
 )
 
 // Scheduler manages scheduled cleanup tasks.

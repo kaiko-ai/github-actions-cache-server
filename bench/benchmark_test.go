@@ -296,6 +296,10 @@ func buildServerBinary(b testing.TB) string {
 }
 
 func repoRoot() string {
+	if root, err := moduleRoot(); err == nil && root != "" {
+		return root
+	}
+
 	wd, err := os.Getwd()
 	if err != nil {
 		return "."
@@ -304,6 +308,20 @@ func repoRoot() string {
 		return filepath.Dir(wd)
 	}
 	return wd
+}
+
+func moduleRoot() (string, error) {
+	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("go list -m: %w", err)
+	}
+
+	root := strings.TrimSpace(string(output))
+	if root == "" {
+		return "", fmt.Errorf("module root is empty")
+	}
+	return root, nil
 }
 
 func startServer(b testing.TB, binary string, bufferBytes int) (string, func()) {
