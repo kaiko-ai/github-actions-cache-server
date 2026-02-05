@@ -2,106 +2,74 @@ name: 🔖 Release
 
 permissions:
   contents: write
-  pull-requests: write
+  packages: write
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Bump version
-        type: choice
+        description: Release version (e.g., v1.2.3)
+        type: string
         required: true
-        options: [⚙️ patch (v1.0.1), 🧩 minor (v1.1.0), ⭐️ major (v2.0.0)]
   push:
     tags:
       - 'v*'
 
-run-name: ${{ github.event_name == 'workflow_dispatch' && format('Bump {0}', startsWith(inputs.version, '⚙️') && 'patch ⚙️' || startsWith(inputs.version, '🧩') && 'minor 🧩' || 'major ⭐️') || github.ref_name }}
-
-env:
-  ⚙️ patch (v1.0.1): patch
-  🧩 minor (v1.1.0): minor
-  ⭐️ major (v2.0.0): major
-
 jobs:
-  release:
-    name: 🔖 Release
+  prepare:
+    if: github.event_name == 'workflow_dispatch'
+    name: 🛠️ Prepare release
     runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
-      RELEASE_REF: ${{ steps.bump-version.outputs.RELEASE_REF }}
-      RELEASE_TAG: ${{ steps.create-release-pr.outputs.RELEASE_TAG }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: dev
           fetch-depth: 0
 
-      - name: 🛤️ Version tag must be on dev branch
-        if: github.event_name == 'push'
-        run: git branch --contains ${{ github.ref }} | grep dev
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-
-      - name: ⬆️ Bump version
-        if: github.event_name == 'workflow_dispatch'
-        id: bump-version
+      - name: Validate version
+        id: version
         run: |
+          VERSION='${{ inputs.version }}'
+          if ! echo "$VERSION" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' >/dev/null; then
+            echo "Invalid version: $VERSION"
+            exit 1
+          fi
+          echo "release_tag=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update chart version
+        run: |
+          VERSION='${{ steps.version.outputs.release_tag }}'
+          VERSION_NO_V=${VERSION#v}
+          sed -E "s/^version:.+$/version: ${VERSION_NO_V}/" -i install/kubernetes/github-actions-cache-server/Chart.yaml
+          sed -E "s/^appVersion:.+$/appVersion: '${VERSION_NO_V}'/" -i install/kubernetes/github-actions-cache-server/Chart.yaml
+
+      - name: Commit and tag
+        run: |
+          VERSION='${{ steps.version.outputs.release_tag }}'
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          npx bumpp ${{ env[inputs.version] }} -y -r --commit "chore(release): v%s" --no-push
-
-          export VERSION=$(git describe --tags --abbrev=0 | sed 's/^v//')
-          sed -E "s/^appVersion:.+$/appVersion: '$VERSION'/" -i install/kubernetes/github-actions-cache-server/Chart.yaml
-          git stage install/kubernetes/github-actions-cache-server/Chart.yaml
-          git commit -n --no-edit --amend
-          git tag -f "v$VERSION"
-
+          git add install/kubernetes/github-actions-cache-server/Chart.yaml
+          git commit -m "chore(release): ${VERSION}" || true
+          git tag -f "${VERSION}"
           git push origin dev
           git push origin --tags
-
-          echo "RELEASE_REF=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: 📥 Create release PR
-        id: create-release-pr
-        run: |
-          TAG_NAME=$(git describe --tags --abbrev=0)
-          echo "RELEASE_TAG=$TAG_NAME" >> "$GITHUB_OUTPUT"
-          RELEASE_BRANCH="release/$TAG_NAME"
-          echo "RELEASE_BRANCH=$RELEASE_BRANCH" >> "$GITHUB_OUTPUT"
-
-          git branch $RELEASE_BRANCH dev
-          git push origin $RELEASE_BRANCH
-
-          gh pr create --title "$TAG_NAME" \
-            --base master --head $RELEASE_BRANCH \
-            --body "Automated pull request for tag $TAG_NAME"
-
-      - name: 📢 Release
-        run: |
-          TAG=$(git describe --tags --abbrev=0)
-          RELEASE_BRANCH=${{ steps.create-release-pr.outputs.RELEASE_BRANCH }}
-          PR_NUMBER=$(gh pr view $RELEASE_BRANCH --json number --template "{{.number}}")
-
-          gh pr merge $RELEASE_BRANCH --merge -t "$TAG (#$PR_NUMBER)" --body "" --delete-branch --admin
-
-          npx changelogithub
 
   deploy-docker:
     name: 🚀 Build and push Docker image
     permissions:
       packages: write
       contents: read
-    needs: [release]
+    needs: [prepare]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'dev' || github.ref_name }}
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
@@ -109,11 +77,10 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.release.outputs.RELEASE_TAG }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.RELEASE_TAG }}
-            type=semver,pattern={{major}},value=${{ needs.release.outputs.RELEASE_TAG }}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }}
             latest
-            dev
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -142,14 +109,16 @@ jobs:
     permissions:
       packages: write
       contents: read
-    needs: [release]
+    needs: [prepare]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     env:
       CHART_DIR: install/kubernetes/github-actions-cache-server
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'dev' || github.ref_name }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3

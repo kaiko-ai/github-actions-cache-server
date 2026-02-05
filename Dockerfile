@@ -1,27 +1,37 @@
-FROM node:24-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
-RUN npm install -g pnpm@latest-10
+# Install build dependencies for CGO (SQLite)
+RUN apk add --no-cache gcc musl-dev
 
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm fetch --prod
+# Copy go mod files
+COPY go.mod go.sum ./
+RUN go mod download
 
+# Copy source code
 COPY . .
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile --prod --offline
 
-ARG BUILD_HASH
-ENV BUILD_HASH=${BUILD_HASH}
-RUN pnpm run build
+# Build with CGO enabled for SQLite support
+RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o server ./cmd/server
 
-# --------------------------------------------
+# Runtime stage
+FROM alpine:3.21
 
-FROM node:24-alpine AS runner
+RUN apk add --no-cache ca-certificates
 
-ENV NITRO_CLUSTER_WORKERS=1
+# Copy the binary
+COPY --from=builder /app/server /server
 
-WORKDIR /app
+# Create a non-root user
+RUN adduser -D -u 1000 appuser
+USER appuser
 
-COPY --from=builder /app/.output ./
+# Create data directory
+RUN mkdir -p /home/appuser/.data
 
-CMD ["node", "--expose-gc", "/app/server/index.mjs"]
+WORKDIR /home/appuser
+
+EXPOSE 3000
+
+ENTRYPOINT ["/server"]

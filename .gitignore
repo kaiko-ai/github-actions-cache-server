@@ -1,15 +1,21 @@
-node_modules
 *.log*
-.nitro
-.cache
-.output
 .env.local
-dist
-data/
-.eslintcache
 .data
 .idea
 .DS_Store
-tests/temp/
 actions-runner/
 benchmark.csv
+
+# Go binaries and build output
+server
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+/bin/
+vendor/
+
+# IDE
+.vscode/

@@ -31,3 +31,23 @@ volumes:
 ## Documentation
 
 👉 <https://gha-cache-server.falcondev.io/getting-started> 👈
+
+## Development
+
+Build and run the Go server locally:
+
+```bash
+go run ./cmd/server
+```
+
+Run tests:
+
+```bash
+go test ./...
+```
+
+Run benchmarks:
+
+```bash
+go test ./... -bench . -benchmem -run ^$
+```

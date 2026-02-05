@@ -15,56 +15,39 @@ concurrency:
 
 jobs:
   lint:
-    name: 💅 Lint
+    name: 🧹 Go Format
     runs-on: ubuntu-latest
     steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
-
-      - name: Cache ESLint & Prettier
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: |
-            .eslintcache
-            node_modules/.cache/prettier/.prettier-cache
-          key: eslint-prettier-cache-${{ runner.os }}
-
-      - run: pnpm run lint:ci
-
-  type-check:
-    name: 🛃 Type Check
-    runs-on: ubuntu-latest
-    steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
-
-      - run: pnpm run type-check
+          go-version: '1.23.x'
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
 
   test-unit:
-    name: 🧪 Unit Tests
+    name: 🧪 Go Tests
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        storage-driver: [filesystem, s3, gcs]
-        db-driver: [postgres, mysql, sqlite]
     steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
-
-      - run: pnpm run test:run
-        env:
-          VITEST_DB_DRIVER: ${{ matrix.db-driver }}
-          VITEST_STORAGE_DRIVER: ${{ matrix.storage-driver }}
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+      - run: go test ./...
 
   benchmark:
-    name: 📊 Benchmark
+    name: 📊 Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
-
-      - name: Run benchmark
-        run: pnpm run benchmark
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+      - name: Run benchmarks
+        env:
+          BENCH_FILE_SIZES_MB: '10,50'
+          BENCH_BUFFER_SIZES_KB: '64,256'
+        run: go test ./... -bench . -benchmem -run ^$ -benchtime=1x
 
   deploy:
     if: github.event.ref == 'refs/heads/dev'
@@ -72,16 +55,12 @@ jobs:
     permissions:
       packages: write
       contents: read
-    needs: [lint, type-check, test-unit]
+    needs: [lint, test-unit, benchmark]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: dev
-
-      - name: Get build hash
-        id: build_hash
-        run: echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
@@ -112,5 +91,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            BUILD_HASH=${{ steps.build_hash.outputs.COMMIT_SHA }}
