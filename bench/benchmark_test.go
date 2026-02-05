@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,8 +22,6 @@ var (
 	defaultFileSizesMB   = []int{100, 500}
 	defaultBufferSizesKB = []int{64, 128, 256, 512, 1024}
 )
-
-var errServerDirMissing = errors.New("cmd/server directory not found")
 
 func BenchmarkCacheServer(b *testing.B) {
 	fileSizes := parseEnvIntList(b, "BENCH_FILE_SIZES_MB", defaultFileSizesMB)
@@ -277,7 +274,7 @@ func buildServerBinary(b testing.TB) string {
 	serverBuildOnce.Do(func() {
 		root := repoRoot()
 		if !hasServerDir(root) {
-			serverBuildErr = fmt.Errorf("%w under %s", errServerDirMissing, root)
+			serverBuildErr = fmt.Errorf("cmd/server not found under %s", root)
 			return
 		}
 
@@ -298,9 +295,6 @@ func buildServerBinary(b testing.TB) string {
 	})
 
 	if serverBuildErr != nil {
-		if errors.Is(serverBuildErr, errServerDirMissing) {
-			b.Skipf("skipping benchmarks: %v", serverBuildErr)
-		}
 		b.Fatalf("failed to build server: %v", serverBuildErr)
 	}
 
@@ -331,13 +325,10 @@ func repoRoot() string {
 		return "."
 	}
 	candidates = append(candidates, wd)
-	if filepath.Base(wd) == "bench" {
-		candidates = append(candidates, filepath.Dir(wd))
-	}
 
 	for _, candidate := range candidates {
-		if hasServerDir(candidate) {
-			return candidate
+		if root, ok := findRootUpwards(candidate); ok {
+			return root
 		}
 	}
 
@@ -382,6 +373,29 @@ func hasServerDir(root string) bool {
 		return false
 	}
 	return info.IsDir()
+}
+
+func findRootUpwards(start string) (string, bool) {
+	if start == "" {
+		return "", false
+	}
+
+	current, err := filepath.Abs(start)
+	if err != nil {
+		return "", false
+	}
+
+	for {
+		if hasServerDir(current) {
+			return current, true
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", false
+		}
+		current = parent
+	}
 }
 
 func startServer(b testing.TB, binary string, bufferBytes int) (string, func()) {
