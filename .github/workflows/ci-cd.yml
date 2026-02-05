@@ -125,6 +125,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Create manifest list and push
+        working-directory: /tmp/digests
         run: |
           docker buildx imagetools create -t "ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME//\//_}" \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' /tmp/digests/*)
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
