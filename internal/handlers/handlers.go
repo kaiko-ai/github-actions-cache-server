@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -30,23 +32,33 @@ import (
 const (
 	signedURLExpiration   = 10 * time.Minute
 	githubResultsReceiver = "https://results-receiver.actions.githubusercontent.com"
+	defaultFinalizeWait   = 30 * time.Second
+	defaultFinalizePoll   = 500 * time.Millisecond
 )
 
 // Handler holds dependencies for HTTP handlers.
 type Handler struct {
-	config  *config.Config
-	db      *db.DB
-	storage storage.Adapter
-	logger  *slog.Logger
+	config              *config.Config
+	db                  *db.DB
+	storage             storage.Adapter
+	logger              *slog.Logger
+	proxyTargetURL      string
+	proxyTransport      http.RoundTripper
+	finalizeWaitTimeout time.Duration
+	finalizePoll        time.Duration
+	uploadChunkLocks    sync.Map
 }
 
 // New creates a new Handler.
 func New(cfg *config.Config, database *db.DB, storageAdapter storage.Adapter, logger *slog.Logger) *Handler {
 	return &Handler{
-		config:  cfg,
-		db:      database,
-		storage: storageAdapter,
-		logger:  logger,
+		config:              cfg,
+		db:                  database,
+		storage:             storageAdapter,
+		logger:              logger,
+		proxyTargetURL:      githubResultsReceiver,
+		finalizeWaitTimeout: defaultFinalizeWait,
+		finalizePoll:        defaultFinalizePoll,
 	}
 }
 
@@ -370,13 +382,37 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 	}
 
 	if expectedSize > 0 {
-		deadline := time.Now().Add(30 * time.Second)
+		waitTimeout := h.finalizeWaitTimeout
+		if waitTimeout <= 0 {
+			waitTimeout = defaultFinalizeWait
+		}
+
+		pollInterval := h.finalizePoll
+		if pollInterval <= 0 {
+			pollInterval = defaultFinalizePoll
+		}
+
+		deadline := time.Now().Add(waitTimeout)
 		for time.Now().Before(deadline) {
 			actualSize, err := h.storage.GetFolderSize(ctx, partsFolder)
 			if err == nil && actualSize >= expectedSize {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(pollInterval)
+		}
+
+		actualSize, err := h.storage.GetFolderSize(ctx, partsFolder)
+		if err != nil {
+			h.logger.Error("failed to get parts folder size", "error", err)
+			h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
+			h.writeJSONError(w, http.StatusInternalServerError, "storage error")
+			return
+		}
+
+		if actualSize < expectedSize {
+			h.recordError(ctx, r.URL.Path, "size_mismatch", http.StatusConflict)
+			h.writeJSONError(w, http.StatusConflict, "Uploaded size does not match expected size")
+			return
 		}
 	}
 
@@ -488,6 +524,24 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Upload the chunk
 	objectName := fmt.Sprintf("%s/parts/%d", upload.FolderName, chunkIndex)
+	unlockChunk := h.lockUploadChunk(objectName)
+	defer unlockChunk()
+
+	existingPart, err := h.storage.CreateDownloadStream(ctx, objectName)
+	if err == nil {
+		existingPart.Close()
+		h.recordError(ctx, r.URL.Path, "duplicate_chunk", http.StatusConflict)
+		h.writeJSONError(w, http.StatusConflict, "chunk already uploaded")
+		return
+	}
+
+	var notFoundErr *storage.ObjectNotFoundError
+	if !errors.As(err, &notFoundErr) {
+		h.logger.Error("failed to check existing chunk", "error", err)
+		h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
+		h.writeJSONError(w, http.StatusInternalServerError, "storage error")
+		return
+	}
 
 	start := time.Now()
 	countingReader := &countingReader{r: r.Body}
@@ -748,7 +802,12 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 // handleCatchAllProxy proxies unknown requests to GitHub results receiver.
 func (h *Handler) handleCatchAllProxy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	targetURL, err := url.Parse(githubResultsReceiver)
+	target := h.proxyTargetURL
+	if target == "" {
+		target = githubResultsReceiver
+	}
+
+	targetURL, err := url.Parse(target)
 	if err != nil {
 		h.logger.Error("failed to parse proxy target URL", "error", err)
 		h.recordError(ctx, r.URL.Path, "proxy_config_error", http.StatusInternalServerError)
@@ -757,6 +816,9 @@ func (h *Handler) handleCatchAllProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	if h.proxyTransport != nil {
+		proxy.Transport = h.proxyTransport
+	}
 
 	// Customize the director to preserve the original request path and query
 	originalDirector := proxy.Director
@@ -854,6 +916,13 @@ func (h *Handler) resetMergeState(ctx context.Context, locationID string) {
 	if err := h.db.ResetStorageLocationMergeState(ctx, locationID); err != nil {
 		h.logger.Error("failed to reset merge state", "error", err, "locationId", locationID)
 	}
+}
+
+func (h *Handler) lockUploadChunk(objectName string) func() {
+	lockAny, _ := h.uploadChunkLocks.LoadOrStore(objectName, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
 }
 
 // countingReader wraps a reader and counts bytes read.

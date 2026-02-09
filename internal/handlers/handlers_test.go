@@ -222,7 +222,7 @@ func TestFinalizeCacheEntryUpload_StringSizeBytes(t *testing.T) {
 	createTestPart(t, h, upload.FolderName, 0)
 
 	// Test: Send finalize request with size_bytes as STRING (GitHub toolkit behavior)
-	body := `{"key": "test-key", "version": "test-version", "size_bytes": "1048576"}`
+	body := `{"key": "test-key", "version": "test-version", "size_bytes": "14"}`
 	req := httptest.NewRequest(http.MethodPost, "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
@@ -244,7 +244,7 @@ func TestFinalizeCacheEntryUpload_NumericSizeBytes(t *testing.T) {
 	createTestPart(t, h, upload.FolderName, 0)
 
 	// Test: Send finalize request with size_bytes as NUMBER
-	body := `{"key": "test-key", "version": "test-version", "size_bytes": 1048576}`
+	body := `{"key": "test-key", "version": "test-version", "size_bytes": 14}`
 	req := httptest.NewRequest(http.MethodPost, "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
