@@ -630,7 +630,8 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 		totalBytes, err = io.Copy(w, reader)
 		if err != nil {
-			h.logger.Error("failed to stream merged file", "error", err)
+			h.handleDownloadStreamError(ctx, w, r.URL.Path, cacheEntryID, loc.ID, loc.FolderName, "merged", totalBytes, err)
+			return
 		}
 	} else {
 		// Need to merge parts
@@ -647,7 +648,8 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		// Stream parts to response
 		totalBytes, err = h.streamParts(ctx, w, loc.FolderName)
 		if err != nil {
-			h.logger.Error("failed to stream parts", "error", err)
+			h.handleDownloadStreamError(ctx, w, r.URL.Path, cacheEntryID, loc.ID, loc.FolderName, "parts", totalBytes, err)
+			return
 		}
 	}
 
@@ -655,6 +657,43 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if m := metrics.Get(); m != nil {
 		m.RecordStorageOperation(ctx, "download", h.config.StorageDriver, time.Since(downloadStart))
 		m.RecordBytesDownloaded(ctx, totalBytes, "download", h.config.StorageDriver, "/download/:cacheEntryId")
+	}
+}
+
+func (h *Handler) handleDownloadStreamError(
+	ctx context.Context,
+	w http.ResponseWriter,
+	path, cacheEntryID, locationID, folderName, source string,
+	totalBytes int64,
+	streamErr error,
+) {
+	h.logger.Error(
+		"failed to stream download",
+		"error", streamErr,
+		"source", source,
+		"cacheEntryId", cacheEntryID,
+		"locationId", locationID,
+		"folderName", folderName,
+		"bytesSent", totalBytes,
+	)
+
+	if totalBytes == 0 {
+		h.recordError(ctx, path, "storage_error", http.StatusInternalServerError)
+		h.writeJSONError(w, http.StatusInternalServerError, "storage error")
+		return
+	}
+
+	h.recordError(ctx, path, "partial_stream", http.StatusInternalServerError)
+	if m := metrics.Get(); m != nil {
+		m.RecordCacheOperation(ctx, "download", "partial_failure")
+	}
+
+	// Best effort: close the underlying client connection so partial bytes are not treated as a successful response.
+	if hijacker, ok := w.(http.Hijacker); ok {
+		conn, _, err := hijacker.Hijack()
+		if err == nil {
+			conn.Close()
+		}
 	}
 }
 
@@ -776,20 +815,6 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 	now := time.Now().UnixMilli()
 	if err := h.db.UpdateStorageLocationMerged(ctx, locationID, now); err != nil {
 		h.logger.Error("failed to mark as merged", "error", err)
-		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
-		h.resetMergeState(ctx, locationID)
-		return
-	}
-
-	// Delete parts folder and mark parts deleted
-	if err := h.storage.DeleteFolder(ctx, partsFolder); err != nil {
-		h.logger.Error("failed to delete parts folder", "error", err, "locationId", locationID)
-		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
-		h.resetMergeState(ctx, locationID)
-		return
-	}
-	if err := h.db.UpdateStorageLocationPartsDeleted(ctx, locationID, now); err != nil {
-		h.logger.Error("failed to mark parts deleted", "error", err, "locationId", locationID)
 		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
 		h.resetMergeState(ctx, locationID)
 		return

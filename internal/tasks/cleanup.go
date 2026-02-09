@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	cleanupPageSize = 10
-	uploadTimeout   = 1 * time.Minute
-	mergeTimeout    = 15 * time.Minute
+	cleanupPageSize                 = 10
+	uploadTimeout                   = 1 * time.Minute
+	mergeTimeout                    = 15 * time.Minute
+	defaultPartsRetentionAfterMerge = 1 * time.Hour
 )
 
 // Scheduler manages scheduled cleanup tasks.
@@ -86,6 +87,12 @@ func (s *Scheduler) Stop() {
 func (s *Scheduler) recordCleanup(ctx context.Context, operation, status string, start time.Time, processed, deleted int64) {
 	if m := metrics.Get(); m != nil {
 		m.RecordCleanupOperation(ctx, operation, status, time.Since(start), processed, deleted)
+	}
+}
+
+func (s *Scheduler) recordCleanupSkip(ctx context.Context, operation, reason string) {
+	if m := metrics.Get(); m != nil {
+		m.RecordCleanupItem(ctx, operation, reason, 1)
 	}
 }
 
@@ -249,7 +256,8 @@ func (s *Scheduler) cleanupParts() {
 
 	totalProcessed := int64(0)
 	totalDeleted := int64(0)
-	now := time.Now().UnixMilli()
+	now := time.Now()
+	nowUnixMilli := now.UnixMilli()
 	status := "success"
 
 	for {
@@ -265,8 +273,30 @@ func (s *Scheduler) cleanupParts() {
 		}
 
 		totalProcessed += int64(len(locations))
+		deletedThisPage := int64(0)
 
 		for _, loc := range locations {
+			mergedObjectName := loc.FolderName + "/merged"
+			mergedReader, err := s.storage.CreateDownloadStream(ctx, mergedObjectName)
+			if err != nil {
+				s.recordCleanupSkip(ctx, "parts", "skip_no_merged")
+				s.logger.Warn("skipping parts cleanup because merged object is unavailable", "locationId", loc.ID, "folder", loc.FolderName, "error", err)
+				continue
+			}
+			mergedReader.Close()
+
+			if !loc.MergedAt.Valid {
+				s.recordCleanupSkip(ctx, "parts", "skip_not_merged")
+				continue
+			}
+
+			mergedAt := time.UnixMilli(loc.MergedAt.Int64)
+			if now.Sub(mergedAt) < defaultPartsRetentionAfterMerge {
+				s.recordCleanupSkip(ctx, "parts", "skip_retention")
+				s.logger.Debug("skipping parts cleanup because retention window is active", "locationId", loc.ID, "mergedAt", loc.MergedAt.Int64, "retention", defaultPartsRetentionAfterMerge.String())
+				continue
+			}
+
 			// Delete parts folder
 			partsFolder := loc.FolderName + "/parts"
 			if err := s.storage.DeleteFolder(ctx, partsFolder); err != nil {
@@ -275,12 +305,21 @@ func (s *Scheduler) cleanupParts() {
 			}
 
 			// Mark parts as deleted
-			if err := s.db.UpdateStorageLocationPartsDeleted(ctx, loc.ID, now); err != nil {
+			if err := s.db.UpdateStorageLocationPartsDeleted(ctx, loc.ID, nowUnixMilli); err != nil {
 				s.logger.Error("failed to mark parts deleted", "error", err, "locationId", loc.ID)
 				continue
 			}
 
 			totalDeleted += int64(loc.PartCount)
+			deletedThisPage++
+			if m := metrics.Get(); m != nil {
+				m.RecordCleanupItem(ctx, "parts", "deleted", int64(loc.PartCount))
+			}
+		}
+
+		// If nothing was deleted, stop to avoid looping forever on the same skipped rows.
+		if deletedThisPage == 0 {
+			break
 		}
 	}
 

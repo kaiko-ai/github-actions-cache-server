@@ -34,6 +34,7 @@ type hookStorageAdapter struct {
 	listErr         error
 	folderSizeErr   error
 	downloadErr     error
+	downloadErrFor  map[string]error
 	deleteFolderErr error
 	downloadURL     string
 	downloadURLErr  error
@@ -48,6 +49,11 @@ func (r roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 func (h *hookStorageAdapter) CreateDownloadStream(ctx context.Context, objectName string) (io.ReadCloser, error) {
 	if h.downloadErr != nil {
 		return nil, h.downloadErr
+	}
+	if h.downloadErrFor != nil {
+		if err, ok := h.downloadErrFor[objectName]; ok {
+			return nil, err
+		}
 	}
 	return h.base.CreateDownloadStream(ctx, objectName)
 }
@@ -648,6 +654,71 @@ func TestDownloadEndpoint_Behaviors(t *testing.T) {
 	}
 	if mergedRR.Body.String() != "merged-content" {
 		t.Fatalf("unexpected merged content: %q", mergedRR.Body.String())
+	}
+}
+
+func TestDownloadEndpoint_StreamPartsErrorBeforeWriting(t *testing.T) {
+	h := setupEndpointHandler(t)
+	router := h.Router()
+
+	entryID, locationID := createCacheEntryWithLocation(t, h, "k-stream-fail", "v1", "folder-stream-fail", 1)
+	if err := h.db.UpdateStorageLocationMergeStarted(context.Background(), locationID, time.Now().UnixMilli()); err != nil {
+		t.Fatalf("failed to mark merge started: %v", err)
+	}
+	createTestPartNumeric(t, h, "folder-stream-fail", 0, []byte("part-zero"))
+
+	h.storage = &hookStorageAdapter{
+		base: h.storage,
+		downloadErrFor: map[string]error{
+			"folder-stream-fail/parts/0": errors.New("open failed"),
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/download/"+entryID, nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when parts stream fails before bytes are sent, got %d (%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMergeInBackground_KeepsPartsForDeferredCleanup(t *testing.T) {
+	h := setupEndpointHandler(t)
+
+	_, locationID := createCacheEntryWithLocation(t, h, "k-merge-keep-parts", "v1", "folder-merge-keep-parts", 2)
+	createTestPartNumeric(t, h, "folder-merge-keep-parts", 0, []byte("zero"))
+	createTestPartNumeric(t, h, "folder-merge-keep-parts", 1, []byte("one"))
+
+	h.mergeInBackground(locationID, "folder-merge-keep-parts")
+
+	loc, err := h.db.GetStorageLocation(context.Background(), locationID)
+	if err != nil {
+		t.Fatalf("failed to read location after merge: %v", err)
+	}
+	if loc == nil || !loc.MergedAt.Valid {
+		t.Fatalf("expected location to be marked as merged")
+	}
+
+	mergedReader, err := h.storage.CreateDownloadStream(context.Background(), "folder-merge-keep-parts/merged")
+	if err != nil {
+		t.Fatalf("expected merged object to exist: %v", err)
+	}
+	mergedBytes, err := io.ReadAll(mergedReader)
+	mergedReader.Close()
+	if err != nil {
+		t.Fatalf("failed reading merged object: %v", err)
+	}
+	if string(mergedBytes) != "zeroone" {
+		t.Fatalf("unexpected merged payload: %q", string(mergedBytes))
+	}
+
+	for _, idx := range []int{0, 1} {
+		partReader, err := h.storage.CreateDownloadStream(context.Background(), fmt.Sprintf("folder-merge-keep-parts/parts/%d", idx))
+		if err != nil {
+			t.Fatalf("expected part %d to remain after merge: %v", idx, err)
+		}
+		partReader.Close()
 	}
 }
 

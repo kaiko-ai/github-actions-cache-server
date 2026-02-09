@@ -489,6 +489,17 @@ func (m *Metrics) RecordCleanupOperation(ctx context.Context, operation, status 
 	}
 }
 
+// RecordCleanupItem records a cleanup item count for a specific type.
+func (m *Metrics) RecordCleanupItem(ctx context.Context, operation, itemType string, count int64) {
+	if m == nil || count <= 0 {
+		return
+	}
+	m.CleanupItemsTotal.Add(ctx, count, metric.WithAttributes(
+		attribute.String("operation", operation),
+		attribute.String("type", itemType),
+	))
+}
+
 // RecordMergeOperation records a merge operation.
 func (m *Metrics) RecordMergeOperation(ctx context.Context, status string, duration time.Duration, bytesWritten int64) {
 	if m == nil {
