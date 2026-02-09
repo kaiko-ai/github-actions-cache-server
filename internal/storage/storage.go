@@ -15,6 +15,9 @@ type Adapter interface {
 	// UploadStream uploads data from a reader to the given object.
 	UploadStream(ctx context.Context, objectName string, r io.Reader) error
 
+	// ObjectExists reports whether an object exists.
+	ObjectExists(ctx context.Context, objectName string) (bool, error)
+
 	// DeleteFolder deletes all objects in a folder.
 	DeleteFolder(ctx context.Context, folderName string) error
 

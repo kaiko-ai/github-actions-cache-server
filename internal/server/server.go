@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/falcosecurity/github-actions-cache-server/internal/config"
 	"github.com/falcosecurity/github-actions-cache-server/internal/db"
@@ -15,6 +16,12 @@ import (
 	"github.com/falcosecurity/github-actions-cache-server/internal/metrics"
 	"github.com/falcosecurity/github-actions-cache-server/internal/storage"
 	"github.com/falcosecurity/github-actions-cache-server/internal/tasks"
+)
+
+const (
+	defaultReadHeaderTimeout = 10 * time.Second
+	defaultIdleTimeout       = 2 * time.Minute
+	defaultMaxHeaderBytes    = 1 << 20 // 1 MiB
 )
 
 // App holds the cache server dependencies and HTTP server.
@@ -81,8 +88,11 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*App, er
 	}
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.Port),
-		Handler: httpHandler,
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Handler:           httpHandler,
+		ReadHeaderTimeout: defaultReadHeaderTimeout,
+		IdleTimeout:       defaultIdleTimeout,
+		MaxHeaderBytes:    defaultMaxHeaderBytes,
 	}
 
 	return &App{

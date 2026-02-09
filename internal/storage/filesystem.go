@@ -62,6 +62,19 @@ func (f *FilesystemAdapter) UploadStream(ctx context.Context, objectName string,
 	return err
 }
 
+// ObjectExists checks whether an object exists.
+func (f *FilesystemAdapter) ObjectExists(ctx context.Context, objectName string) (bool, error) {
+	path := filepath.Join(f.rootPath, objectName)
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
 // DeleteFolder removes a folder and all its contents.
 func (f *FilesystemAdapter) DeleteFolder(ctx context.Context, folderName string) error {
 	path := filepath.Join(f.rootPath, folderName)

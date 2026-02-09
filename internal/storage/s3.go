@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 )
 
 const (
@@ -86,6 +88,14 @@ func (s *S3Adapter) fullKey(objectName string) string {
 	return s3KeyPrefix + "/" + objectName
 }
 
+func isS3NotFoundError(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "NoSuchKey" || apiErr.ErrorCode() == "NotFound"
+	}
+	return false
+}
+
 // CreateDownloadStream downloads an object from S3.
 func (s *S3Adapter) CreateDownloadStream(ctx context.Context, objectName string) (io.ReadCloser, error) {
 	result, err := s.client.GetObject(ctx, &s3.GetObjectInput{
@@ -93,8 +103,7 @@ func (s *S3Adapter) CreateDownloadStream(ctx context.Context, objectName string)
 		Key:    aws.String(s.fullKey(objectName)),
 	})
 	if err != nil {
-		// Check if it's a not found error
-		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "NotFound") {
+		if isS3NotFoundError(err) {
 			return nil, &ObjectNotFoundError{ObjectName: objectName}
 		}
 		return nil, err
@@ -115,6 +124,21 @@ func (s *S3Adapter) UploadStream(ctx context.Context, objectName string, r io.Re
 		Body:   r,
 	})
 	return err
+}
+
+// ObjectExists checks whether an object exists.
+func (s *S3Adapter) ObjectExists(ctx context.Context, objectName string) (bool, error) {
+	_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.fullKey(objectName)),
+	})
+	if err == nil {
+		return true, nil
+	}
+	if isS3NotFoundError(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // DeleteFolder deletes all objects with a given prefix.

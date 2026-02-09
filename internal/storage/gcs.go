@@ -88,6 +88,18 @@ func (g *GCSAdapter) UploadStream(ctx context.Context, objectName string, r io.R
 	return writer.Close()
 }
 
+// ObjectExists checks whether an object exists.
+func (g *GCSAdapter) ObjectExists(ctx context.Context, objectName string) (bool, error) {
+	_, err := g.client.Bucket(g.bucket).Object(g.fullKey(objectName)).Attrs(ctx)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
 // DeleteFolder deletes all objects with a given prefix.
 func (g *GCSAdapter) DeleteFolder(ctx context.Context, folderName string) error {
 	prefix := g.fullKey(folderName) + "/"

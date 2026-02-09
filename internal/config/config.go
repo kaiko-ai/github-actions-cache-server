@@ -33,6 +33,11 @@ type Config struct {
 	// Database configuration
 	DBDriver string // sqlite, postgres, mysql
 
+	// Database pool configuration
+	DBMaxOpenConns           int
+	DBMaxIdleConns           int
+	DBConnMaxLifetimeSeconds int
+
 	// SQLite
 	DBSqlitePath string
 
@@ -85,8 +90,11 @@ func Load() (*Config, error) {
 		StorageGCSEndpoint:          os.Getenv("STORAGE_GCS_ENDPOINT"),
 
 		// Database defaults
-		DBDriver:     getEnvOrDefault("DB_DRIVER", "sqlite"),
-		DBSqlitePath: getEnvOrDefault("DB_SQLITE_PATH", ".data/sqlite.db"),
+		DBDriver:                 getEnvOrDefault("DB_DRIVER", "sqlite"),
+		DBSqlitePath:             getEnvOrDefault("DB_SQLITE_PATH", ".data/sqlite.db"),
+		DBMaxOpenConns:           getEnvIntOrDefault("DB_MAX_OPEN_CONNS", 10),
+		DBMaxIdleConns:           getEnvIntOrDefault("DB_MAX_IDLE_CONNS", 5),
+		DBConnMaxLifetimeSeconds: getEnvIntOrDefault("DB_CONN_MAX_LIFETIME_SECONDS", 3600),
 
 		// PostgreSQL
 		DBPostgresURL:      os.Getenv("DB_POSTGRES_URL"),
@@ -163,6 +171,19 @@ func (c *Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("invalid DB_DRIVER: %s (must be sqlite, postgres, or mysql)", c.DBDriver)
+	}
+
+	if c.DBMaxOpenConns < 0 {
+		return errors.New("DB_MAX_OPEN_CONNS must be >= 0")
+	}
+	if c.DBMaxIdleConns < 0 {
+		return errors.New("DB_MAX_IDLE_CONNS must be >= 0")
+	}
+	if c.DBConnMaxLifetimeSeconds < 0 {
+		return errors.New("DB_CONN_MAX_LIFETIME_SECONDS must be >= 0")
+	}
+	if c.DBMaxOpenConns > 0 && c.DBMaxIdleConns > c.DBMaxOpenConns {
+		return errors.New("DB_MAX_IDLE_CONNS cannot exceed DB_MAX_OPEN_CONNS")
 	}
 
 	return nil

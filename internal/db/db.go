@@ -61,6 +61,8 @@ type Upload struct {
 	FolderName         string        `db:"folderName"`
 	CreatedAt          int64         `db:"createdAt"`
 	LastPartUploadedAt sql.NullInt64 `db:"lastPartUploadedAt"`
+	UploadedBytes      int64         `db:"uploadedBytes"`
+	UploadedParts      int           `db:"uploadedParts"`
 }
 
 // New creates a new database connection based on configuration.
@@ -87,10 +89,35 @@ func New(cfg *config.Config) (*DB, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	// Set connection pool settings
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Hour)
+	// Set connection pool settings.
+	maxOpenConns := cfg.DBMaxOpenConns
+	if maxOpenConns <= 0 {
+		maxOpenConns = 10
+	}
+
+	maxIdleConns := cfg.DBMaxIdleConns
+	if maxIdleConns < 0 {
+		maxIdleConns = 0
+	}
+	if maxIdleConns > maxOpenConns {
+		maxIdleConns = maxOpenConns
+	}
+
+	// SQLite in-memory databases are per-connection; use a single connection to keep
+	// schema and data visible across queries.
+	if driver == "sqlite3" && strings.Contains(cfg.DBSqlitePath, ":memory:") {
+		maxOpenConns = 1
+		maxIdleConns = 1
+	}
+
+	connMaxLifetime := time.Duration(cfg.DBConnMaxLifetimeSeconds) * time.Second
+	if connMaxLifetime <= 0 {
+		connMaxLifetime = time.Hour
+	}
+
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxLifetime(connMaxLifetime)
 
 	return &DB{DB: db, driver: driver}, nil
 }
@@ -126,11 +153,29 @@ func (d *DB) Migrate(ctx context.Context) error {
 			continue
 		}
 		if _, err := d.ExecContext(ctx, stmt); err != nil {
+			if d.isIgnorableMigrationError(stmt, err) {
+				continue
+			}
 			return fmt.Errorf("failed to execute migration statement: %w\nStatement: %s", err, stmt)
 		}
 	}
 
 	return nil
+}
+
+func (d *DB) isIgnorableMigrationError(stmt string, err error) bool {
+	stmtLower := strings.ToLower(strings.TrimSpace(stmt))
+	errLower := strings.ToLower(err.Error())
+
+	if strings.HasPrefix(stmtLower, "create index") {
+		return strings.Contains(errLower, "already exists") || strings.Contains(errLower, "duplicate key name")
+	}
+
+	if strings.HasPrefix(stmtLower, "alter table") && strings.Contains(stmtLower, "add column") {
+		return strings.Contains(errLower, "duplicate column") || strings.Contains(errLower, "already exists")
+	}
+
+	return false
 }
 
 // Placeholder returns the appropriate placeholder for the database driver.
@@ -180,10 +225,26 @@ func (d *DB) col(name string) string {
 
 // CreateUpload creates a new upload record.
 func (d *DB) CreateUpload(ctx context.Context, upload *Upload) error {
-	query := fmt.Sprintf(`INSERT INTO uploads (id, %s, version, %s, %s) VALUES (?, ?, ?, ?, ?)`,
-		d.keyCol(), d.col("folderName"), d.col("createdAt"))
+	query := fmt.Sprintf(
+		`INSERT INTO uploads (id, %s, version, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		d.keyCol(),
+		d.col("folderName"),
+		d.col("createdAt"),
+		d.col("uploadedBytes"),
+		d.col("uploadedParts"),
+	)
 	start := time.Now()
-	_, err := d.ExecContext(ctx, d.Rebind(query), upload.ID, upload.Key, upload.Version, upload.FolderName, upload.CreatedAt)
+	_, err := d.ExecContext(
+		ctx,
+		d.Rebind(query),
+		upload.ID,
+		upload.Key,
+		upload.Version,
+		upload.FolderName,
+		upload.CreatedAt,
+		upload.UploadedBytes,
+		upload.UploadedParts,
+	)
 	d.recordDBQuery(ctx, "uploads", start)
 	return err
 }
@@ -191,8 +252,15 @@ func (d *DB) CreateUpload(ctx context.Context, upload *Upload) error {
 // GetUpload retrieves an upload by ID.
 func (d *DB) GetUpload(ctx context.Context, id int64) (*Upload, error) {
 	var upload Upload
-	query := fmt.Sprintf(`SELECT id, %s, version, %s, %s, %s FROM uploads WHERE id = ?`,
-		d.keyCol(), d.col("folderName"), d.col("createdAt"), d.col("lastPartUploadedAt"))
+	query := fmt.Sprintf(
+		`SELECT id, %s, version, %s, %s, %s, %s, %s FROM uploads WHERE id = ?`,
+		d.keyCol(),
+		d.col("folderName"),
+		d.col("createdAt"),
+		d.col("lastPartUploadedAt"),
+		d.col("uploadedBytes"),
+		d.col("uploadedParts"),
+	)
 	start := time.Now()
 	err := d.GetContext(ctx, &upload, d.Rebind(query), id)
 	d.recordDBQuery(ctx, "uploads", start)
@@ -211,6 +279,26 @@ func (d *DB) UpdateUploadLastPart(ctx context.Context, id int64, timestamp int64
 	return err
 }
 
+// UpdateUploadProgress updates upload progress after a successfully persisted chunk.
+func (d *DB) UpdateUploadProgress(ctx context.Context, id int64, timestamp int64, bytesDelta int64) error {
+	if bytesDelta < 0 {
+		bytesDelta = 0
+	}
+
+	query := fmt.Sprintf(
+		`UPDATE uploads SET %s = ?, %s = %s + ?, %s = %s + 1 WHERE id = ?`,
+		d.col("lastPartUploadedAt"),
+		d.col("uploadedBytes"),
+		d.col("uploadedBytes"),
+		d.col("uploadedParts"),
+		d.col("uploadedParts"),
+	)
+	start := time.Now()
+	_, err := d.ExecContext(ctx, d.Rebind(query), timestamp, bytesDelta, id)
+	d.recordDBQuery(ctx, "uploads", start)
+	return err
+}
+
 // DeleteUpload deletes an upload by ID.
 func (d *DB) DeleteUpload(ctx context.Context, id int64) error {
 	query := `DELETE FROM uploads WHERE id = ?`
@@ -223,8 +311,15 @@ func (d *DB) DeleteUpload(ctx context.Context, id int64) error {
 // GetUploadByKeyVersion retrieves an upload by key and version.
 func (d *DB) GetUploadByKeyVersion(ctx context.Context, key, version string) (*Upload, error) {
 	var upload Upload
-	query := fmt.Sprintf(`SELECT id, %[1]s, version, %[2]s, %[3]s, %[4]s FROM uploads WHERE %[1]s = ? AND version = ?`,
-		d.keyCol(), d.col("folderName"), d.col("createdAt"), d.col("lastPartUploadedAt"))
+	query := fmt.Sprintf(
+		`SELECT id, %[1]s, version, %[2]s, %[3]s, %[4]s, %[5]s, %[6]s FROM uploads WHERE %[1]s = ? AND version = ?`,
+		d.keyCol(),
+		d.col("folderName"),
+		d.col("createdAt"),
+		d.col("lastPartUploadedAt"),
+		d.col("uploadedBytes"),
+		d.col("uploadedParts"),
+	)
 	start := time.Now()
 	err := d.GetContext(ctx, &upload, d.Rebind(query), key, version)
 	d.recordDBQuery(ctx, "uploads", start)
@@ -440,14 +535,6 @@ func (d *DB) CompleteUpload(ctx context.Context, uploadID int64, cacheEntry *Cac
 			d.recordDBQuery(ctx, "storage_locations", start)
 		}
 
-		// Delete the old storage location (cascade will not apply here since we're updating the cache entry)
-		deleteOldLocQuery := `DELETE FROM storage_locations WHERE id = ?`
-		start = time.Now()
-		if _, err := tx.ExecContext(ctx, d.Rebind(deleteOldLocQuery), existingEntry.LocationID); err != nil {
-			return nil, err
-		}
-		d.recordDBQuery(ctx, "storage_locations", start)
-
 		// Update the existing cache entry with new location
 		updateEntryQuery := fmt.Sprintf(`UPDATE cache_entries SET %s = ?, %s = ? WHERE id = ?`,
 			d.col("locationId"), d.col("updatedAt"))
@@ -456,6 +543,14 @@ func (d *DB) CompleteUpload(ctx context.Context, uploadID int64, cacheEntry *Cac
 			return nil, err
 		}
 		d.recordDBQuery(ctx, "cache_entries", start)
+
+		// Delete the old storage location after the cache entry points to the new one.
+		deleteOldLocQuery := `DELETE FROM storage_locations WHERE id = ?`
+		start = time.Now()
+		if _, err := tx.ExecContext(ctx, d.Rebind(deleteOldLocQuery), existingEntry.LocationID); err != nil {
+			return nil, err
+		}
+		d.recordDBQuery(ctx, "storage_locations", start)
 	} else if err == sql.ErrNoRows {
 		// No existing entry - create new cache entry
 		createEntryQuery := fmt.Sprintf(`INSERT INTO cache_entries (id, %s, version, %s, %s) VALUES (?, ?, ?, ?, ?)`,
@@ -479,10 +574,10 @@ func (d *DB) CompleteUpload(ctx context.Context, uploadID int64, cacheEntry *Cac
 // GetStaleUploads retrieves uploads that haven't been updated recently.
 func (d *DB) GetStaleUploads(ctx context.Context, olderThan int64, limit int) ([]*Upload, error) {
 	var uploads []*Upload
-	query := fmt.Sprintf(`SELECT id, %s, version, %s, %s, %s FROM uploads
-		WHERE %s < ? AND (%s IS NULL OR %s < ?)
-		LIMIT ?`,
-		d.keyCol(), d.col("folderName"), d.col("createdAt"), d.col("lastPartUploadedAt"),
+	query := fmt.Sprintf(`SELECT id, %s, version, %s, %s, %s, %s, %s FROM uploads
+			WHERE %s < ? AND (%s IS NULL OR %s < ?)
+			LIMIT ?`,
+		d.keyCol(), d.col("folderName"), d.col("createdAt"), d.col("lastPartUploadedAt"), d.col("uploadedBytes"), d.col("uploadedParts"),
 		d.col("createdAt"), d.col("lastPartUploadedAt"), d.col("lastPartUploadedAt"))
 	start := time.Now()
 	err := d.SelectContext(ctx, &uploads, d.Rebind(query), olderThan, olderThan, limit)

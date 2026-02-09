@@ -36,6 +36,7 @@ type hookStorageAdapter struct {
 	downloadErr     error
 	downloadErrFor  map[string]error
 	deleteFolderErr error
+	existsErr       error
 	downloadURL     string
 	downloadURLErr  error
 }
@@ -63,6 +64,13 @@ func (h *hookStorageAdapter) UploadStream(ctx context.Context, objectName string
 		return h.uploadErr
 	}
 	return h.base.UploadStream(ctx, objectName, r)
+}
+
+func (h *hookStorageAdapter) ObjectExists(ctx context.Context, objectName string) (bool, error) {
+	if h.existsErr != nil {
+		return false, h.existsErr
+	}
+	return h.base.ObjectExists(ctx, objectName)
 }
 
 func (h *hookStorageAdapter) DeleteFolder(ctx context.Context, folderName string) error {

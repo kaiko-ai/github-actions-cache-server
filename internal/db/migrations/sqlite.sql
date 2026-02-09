@@ -24,7 +24,12 @@ CREATE TABLE IF NOT EXISTS uploads (
   version TEXT NOT NULL,
   folderName TEXT NOT NULL,
   createdAt INTEGER NOT NULL,
-  lastPartUploadedAt INTEGER
+  lastPartUploadedAt INTEGER,
+  uploadedBytes INTEGER NOT NULL DEFAULT 0,
+  uploadedParts INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_uploads_key_version ON uploads(key, version)
+CREATE INDEX IF NOT EXISTS idx_uploads_key_version ON uploads(key, version);
+
+ALTER TABLE uploads ADD COLUMN uploadedBytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE uploads ADD COLUMN uploadedParts INTEGER NOT NULL DEFAULT 0;

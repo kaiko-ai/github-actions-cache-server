@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -34,6 +33,7 @@ const (
 	githubResultsReceiver = "https://results-receiver.actions.githubusercontent.com"
 	defaultFinalizeWait   = 30 * time.Second
 	defaultFinalizePoll   = 500 * time.Millisecond
+	uploadChunkLockShards = 1024
 )
 
 // Handler holds dependencies for HTTP handlers.
@@ -46,7 +46,7 @@ type Handler struct {
 	proxyTransport      http.RoundTripper
 	finalizeWaitTimeout time.Duration
 	finalizePoll        time.Duration
-	uploadChunkLocks    sync.Map
+	uploadChunkLocks    [uploadChunkLockShards]sync.Mutex
 }
 
 // New creates a new Handler.
@@ -375,13 +375,32 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 
 	partsFolder := fmt.Sprintf("%s/parts", upload.FolderName)
 
-	// Parse expected size from request and wait for all bytes to arrive
+	// Parse expected size from request and wait for all bytes to arrive.
 	var expectedSize int64
 	if req.SizeBytes != "" {
-		expectedSize, _ = req.SizeBytes.Int64()
+		var parseErr error
+		expectedSize, parseErr = req.SizeBytes.Int64()
+		if parseErr != nil || expectedSize < 0 {
+			h.recordError(ctx, r.URL.Path, "invalid_request", http.StatusBadRequest)
+			h.writeJSONError(w, http.StatusBadRequest, "invalid size_bytes value")
+			return
+		}
 	}
 
+	actualSize := upload.UploadedBytes
 	if expectedSize > 0 {
+		// Backward compatibility: old in-flight uploads may not have DB progress.
+		if upload.UploadedBytes == 0 && upload.UploadedParts == 0 {
+			storageSize, err := h.storage.GetFolderSize(ctx, partsFolder)
+			if err != nil {
+				h.logger.Error("failed to get parts folder size", "error", err)
+				h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
+				h.writeJSONError(w, http.StatusInternalServerError, "storage error")
+				return
+			}
+			actualSize = storageSize
+		}
+
 		waitTimeout := h.finalizeWaitTimeout
 		if waitTimeout <= 0 {
 			waitTimeout = defaultFinalizeWait
@@ -393,20 +412,38 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 		}
 
 		deadline := time.Now().Add(waitTimeout)
-		for time.Now().Before(deadline) {
-			actualSize, err := h.storage.GetFolderSize(ctx, partsFolder)
-			if err == nil && actualSize >= expectedSize {
-				break
-			}
+		for actualSize < expectedSize && time.Now().Before(deadline) {
 			time.Sleep(pollInterval)
+
+			latestUpload, err := h.db.GetUpload(ctx, upload.ID)
+			if err != nil {
+				h.logger.Error("failed to refresh upload progress", "error", err)
+				h.recordError(ctx, r.URL.Path, "database_error", http.StatusInternalServerError)
+				h.writeJSONError(w, http.StatusInternalServerError, "database error")
+				return
+			}
+			if latestUpload == nil {
+				h.recordError(ctx, r.URL.Path, "not_found", http.StatusNotFound)
+				h.writeJSONError(w, http.StatusNotFound, "Upload not found")
+				return
+			}
+
+			upload = latestUpload
+			actualSize = upload.UploadedBytes
 		}
 
-		actualSize, err := h.storage.GetFolderSize(ctx, partsFolder)
-		if err != nil {
-			h.logger.Error("failed to get parts folder size", "error", err)
-			h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
-			h.writeJSONError(w, http.StatusInternalServerError, "storage error")
-			return
+		if actualSize < expectedSize {
+			// Final fallback for legacy uploads where progress isn't tracked in DB.
+			storageSize, err := h.storage.GetFolderSize(ctx, partsFolder)
+			if err != nil {
+				h.logger.Error("failed to get parts folder size", "error", err)
+				h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
+				h.writeJSONError(w, http.StatusInternalServerError, "storage error")
+				return
+			}
+			if storageSize > actualSize {
+				actualSize = storageSize
+			}
 		}
 
 		if actualSize < expectedSize {
@@ -416,18 +453,22 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 		}
 	}
 
-	// Count uploaded parts
-	partCount, err := h.storage.CountFilesInFolder(ctx, partsFolder)
-	if err != nil {
-		h.logger.Error("failed to count parts", "error", err)
-		h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
-		h.writeJSONError(w, http.StatusInternalServerError, "storage error")
-		return
-	}
+	// Read uploaded part count from DB. Fallback to storage for old in-flight uploads.
+	partCount := upload.UploadedParts
 	if partCount == 0 {
-		h.recordError(ctx, r.URL.Path, "no_parts", http.StatusInternalServerError)
-		h.writeJSONError(w, http.StatusInternalServerError, "No parts found for upload")
-		return
+		count, err := h.storage.CountFilesInFolder(ctx, partsFolder)
+		if err != nil {
+			h.logger.Error("failed to count parts", "error", err)
+			h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
+			h.writeJSONError(w, http.StatusInternalServerError, "storage error")
+			return
+		}
+		partCount = count
+		if partCount == 0 {
+			h.recordError(ctx, r.URL.Path, "no_parts", http.StatusInternalServerError)
+			h.writeJSONError(w, http.StatusInternalServerError, "No parts found for upload")
+			return
+		}
 	}
 
 	// Create storage location and cache entry
@@ -527,19 +568,16 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	unlockChunk := h.lockUploadChunk(objectName)
 	defer unlockChunk()
 
-	existingPart, err := h.storage.CreateDownloadStream(ctx, objectName)
-	if err == nil {
-		existingPart.Close()
-		h.recordError(ctx, r.URL.Path, "duplicate_chunk", http.StatusConflict)
-		h.writeJSONError(w, http.StatusConflict, "chunk already uploaded")
-		return
-	}
-
-	var notFoundErr *storage.ObjectNotFoundError
-	if !errors.As(err, &notFoundErr) {
+	exists, err := h.storage.ObjectExists(ctx, objectName)
+	if err != nil {
 		h.logger.Error("failed to check existing chunk", "error", err)
 		h.recordError(ctx, r.URL.Path, "storage_error", http.StatusInternalServerError)
 		h.writeJSONError(w, http.StatusInternalServerError, "storage error")
+		return
+	}
+	if exists {
+		h.recordError(ctx, r.URL.Path, "duplicate_chunk", http.StatusConflict)
+		h.writeJSONError(w, http.StatusConflict, "chunk already uploaded")
 		return
 	}
 
@@ -561,10 +599,10 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		m.RecordBytesUploaded(ctx, countingReader.count, "uploadPart", h.config.StorageDriver, "/upload/:uploadId")
 	}
 
-	// Update last part uploaded timestamp
+	// Update upload progress counters.
 	now := time.Now().UnixMilli()
-	if err := h.db.UpdateUploadLastPart(ctx, uploadID, now); err != nil {
-		h.logger.Error("failed to update upload timestamp", "error", err)
+	if err := h.db.UpdateUploadProgress(ctx, uploadID, now, countingReader.count); err != nil {
+		h.logger.Error("failed to update upload progress", "error", err)
 	}
 
 	w.Header().Set("x-ms-request-id", uuid.New().String())
@@ -741,7 +779,6 @@ func (h *Handler) streamParts(ctx context.Context, w io.Writer, folderName strin
 func (h *Handler) mergeInBackground(locationID, folderName string) {
 	ctx := context.Background()
 	mergeStart := time.Now()
-	var bytesWritten int64
 
 	// List part files
 	partsFolder := fmt.Sprintf("%s/parts", folderName)
@@ -767,29 +804,36 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 
 	// Create a pipe to stream merged content
 	pr, pw := io.Pipe()
+	pipeResultCh := make(chan mergePipeResult, 1)
 
-	// Write parts to pipe in goroutine and track bytes
-	var pipeErr error
+	// Write parts to pipe in goroutine and track bytes.
 	go func() {
-		defer pw.Close()
+		var result mergePipeResult
+		defer func() {
+			if result.err != nil {
+				_ = pw.CloseWithError(result.err)
+			} else {
+				_ = pw.Close()
+			}
+			pipeResultCh <- result
+		}()
+
 		for _, idx := range indices {
 			objectName := fmt.Sprintf("%s/parts/%d", folderName, idx)
 			reader, err := h.storage.CreateDownloadStream(ctx, objectName)
 			if err != nil {
 				h.logger.Error("failed to open part for merge", "error", err, "part", idx)
-				pipeErr = err
-				pw.CloseWithError(err)
+				result.err = err
 				return
 			}
 
 			n, err := io.Copy(pw, reader)
 			reader.Close()
-			bytesWritten += n
+			result.bytesWritten += n
 
 			if err != nil {
 				h.logger.Error("failed to copy part for merge", "error", err, "part", idx)
-				pipeErr = err
-				pw.CloseWithError(err)
+				result.err = err
 				return
 			}
 		}
@@ -797,15 +841,23 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 
 	// Upload merged file
 	objectName := fmt.Sprintf("%s/merged", folderName)
-	if err := h.storage.UploadStream(ctx, objectName, pr); err != nil {
-		h.logger.Error("failed to upload merged file", "error", err)
-		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
+	uploadErr := h.storage.UploadStream(ctx, objectName, pr)
+	if uploadErr != nil {
+		_ = pr.CloseWithError(uploadErr)
+	}
+
+	pipeResult := <-pipeResultCh
+	bytesWritten := pipeResult.bytesWritten
+
+	if uploadErr != nil {
+		h.logger.Error("failed to upload merged file", "error", uploadErr)
 		h.resetMergeState(ctx, locationID)
+		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
 		return
 	}
 
 	// Check if pipe had an error
-	if pipeErr != nil {
+	if pipeResult.err != nil {
 		h.recordMergeResult(ctx, "failure", mergeStart, bytesWritten)
 		h.resetMergeState(ctx, locationID)
 		return
@@ -943,9 +995,22 @@ func (h *Handler) resetMergeState(ctx context.Context, locationID string) {
 	}
 }
 
+type mergePipeResult struct {
+	bytesWritten int64
+	err          error
+}
+
+func uploadChunkLockIndex(objectName string) int {
+	var hash uint32 = 2166136261
+	for i := range len(objectName) {
+		hash ^= uint32(objectName[i])
+		hash *= 16777619
+	}
+	return int(hash % uploadChunkLockShards)
+}
+
 func (h *Handler) lockUploadChunk(objectName string) func() {
-	lockAny, _ := h.uploadChunkLocks.LoadOrStore(objectName, &sync.Mutex{})
-	lock := lockAny.(*sync.Mutex)
+	lock := &h.uploadChunkLocks[uploadChunkLockIndex(objectName)]
 	lock.Lock()
 	return lock.Unlock
 }

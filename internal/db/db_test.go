@@ -86,16 +86,22 @@ func TestDB_UploadCRUD(t *testing.T) {
 		t.Fatal("upload not found by key/version")
 	}
 
-	// Update last part uploaded
+	// Update upload progress
 	now := time.Now().UnixMilli()
-	err = db.UpdateUploadLastPart(ctx, upload.ID, now)
+	err = db.UpdateUploadProgress(ctx, upload.ID, now, 123)
 	if err != nil {
-		t.Fatalf("failed to update last part: %v", err)
+		t.Fatalf("failed to update upload progress: %v", err)
 	}
 
 	retrieved, _ = db.GetUpload(ctx, upload.ID)
 	if !retrieved.LastPartUploadedAt.Valid || retrieved.LastPartUploadedAt.Int64 != now {
 		t.Error("last part uploaded at not updated")
+	}
+	if retrieved.UploadedBytes != 123 {
+		t.Errorf("expected uploaded bytes 123, got %d", retrieved.UploadedBytes)
+	}
+	if retrieved.UploadedParts != 1 {
+		t.Errorf("expected uploaded parts 1, got %d", retrieved.UploadedParts)
 	}
 
 	// Delete upload
