@@ -648,6 +648,121 @@ func (d *DB) GetOrphanedStorageLocations(ctx context.Context, limit int) ([]*Sto
 	return locs, err
 }
 
+// CacheEntryWithLocation is a joined view of a cache entry and its storage location.
+type CacheEntryWithLocation struct {
+	ID               string        `db:"id" json:"id"`
+	Key              string        `db:"key" json:"key"`
+	Version          string        `db:"version" json:"version"`
+	UpdatedAt        int64         `db:"updatedAt" json:"updatedAt"`
+	LocationID       string        `db:"locationId" json:"locationId"`
+	FolderName       string        `db:"folderName" json:"folderName"`
+	PartCount        int           `db:"partCount" json:"partCount"`
+	MergedAt         sql.NullInt64 `db:"mergedAt" json:"-"`
+	LastDownloadedAt sql.NullInt64 `db:"lastDownloadedAt" json:"-"`
+}
+
+// ListCacheEntriesResult contains the paginated result of listing cache entries.
+type ListCacheEntriesResult struct {
+	Entries []*CacheEntryWithLocation
+	Total   int
+}
+
+// ListCacheEntries returns a paginated list of cache entries joined with their storage locations.
+// An optional keyPrefix filters entries whose key starts with the given string.
+func (d *DB) ListCacheEntries(ctx context.Context, keyPrefix string, limit, offset int) (*ListCacheEntriesResult, error) {
+	var args []any
+	where := ""
+	if keyPrefix != "" {
+		where = fmt.Sprintf(" WHERE ce.%s LIKE ?", d.keyCol())
+		args = append(args, keyPrefix+"%")
+	}
+
+	// Count total
+	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM cache_entries ce%s`, where)
+	start := time.Now()
+	var total int
+	if err := d.GetContext(ctx, &total, d.Rebind(countQuery), args...); err != nil {
+		return nil, err
+	}
+	d.recordDBQuery(ctx, "cache_entries", start)
+
+	// Select page
+	selectQuery := fmt.Sprintf(
+		`SELECT ce.id, ce.%[1]s, ce.version, ce.%[2]s, ce.%[3]s,
+			sl.%[4]s, sl.%[5]s, sl.%[6]s, sl.%[7]s
+		FROM cache_entries ce
+		INNER JOIN storage_locations sl ON sl.id = ce.%[3]s%[8]s
+		ORDER BY ce.%[2]s DESC
+		LIMIT ? OFFSET ?`,
+		d.keyCol(),
+		d.col("updatedAt"),
+		d.col("locationId"),
+		d.col("folderName"),
+		d.col("partCount"),
+		d.col("mergedAt"),
+		d.col("lastDownloadedAt"),
+		where,
+	)
+	selectArgs := append(args, limit, offset)
+	start = time.Now()
+	var entries []*CacheEntryWithLocation
+	if err := d.SelectContext(ctx, &entries, d.Rebind(selectQuery), selectArgs...); err != nil {
+		return nil, err
+	}
+	d.recordDBQuery(ctx, "cache_entries", start)
+
+	return &ListCacheEntriesResult{Entries: entries, Total: total}, nil
+}
+
+// CacheStats holds aggregate statistics about the cache.
+type CacheStats struct {
+	TotalEntries        int   `db:"total_entries" json:"totalEntries"`
+	MergedEntries       int   `db:"merged_entries" json:"mergedEntries"`
+	UnmergedEntries     int   `db:"unmerged_entries" json:"unmergedEntries"`
+	ActiveUploads       int   `db:"active_uploads" json:"activeUploads"`
+	OldestEntryAt       int64 `db:"oldest_entry_at" json:"oldestEntryAt"`
+	NewestEntryAt       int64 `db:"newest_entry_at" json:"newestEntryAt"`
+	CurrentlyMerging    int   `db:"currently_merging" json:"currentlyMerging"`
+	StaleMerges         int   `db:"stale_merges" json:"staleMerges"`
+	PartsCleanupPending int   `db:"parts_cleanup_pending" json:"partsCleanupPending"`
+	OrphanedLocations   int   `db:"orphaned_locations" json:"orphanedLocations"`
+}
+
+// GetCacheStats returns aggregate statistics about cache entries, storage locations, and uploads.
+func (d *DB) GetCacheStats(ctx context.Context, staleMergeThreshold int64) (*CacheStats, error) {
+	query := fmt.Sprintf(`SELECT
+		(SELECT COUNT(*) FROM cache_entries) AS total_entries,
+		(SELECT COUNT(*) FROM storage_locations WHERE %[1]s IS NOT NULL) AS merged_entries,
+		(SELECT COUNT(*) FROM storage_locations sl
+			INNER JOIN cache_entries ce ON ce.%[2]s = sl.id
+			WHERE %[1]s IS NULL) AS unmerged_entries,
+		(SELECT COUNT(*) FROM uploads) AS active_uploads,
+		COALESCE((SELECT MIN(%[3]s) FROM cache_entries), 0) AS oldest_entry_at,
+		COALESCE((SELECT MAX(%[3]s) FROM cache_entries), 0) AS newest_entry_at,
+		(SELECT COUNT(*) FROM storage_locations
+			WHERE %[4]s IS NOT NULL AND %[1]s IS NULL) AS currently_merging,
+		(SELECT COUNT(*) FROM storage_locations
+			WHERE %[4]s IS NOT NULL AND %[1]s IS NULL AND %[4]s < ?) AS stale_merges,
+		(SELECT COUNT(*) FROM storage_locations
+			WHERE %[1]s IS NOT NULL AND %[5]s IS NULL) AS parts_cleanup_pending,
+		(SELECT COUNT(*) FROM storage_locations sl2
+			LEFT JOIN cache_entries ce2 ON ce2.%[2]s = sl2.id
+			WHERE ce2.id IS NULL) AS orphaned_locations`,
+		d.col("mergedAt"),
+		d.col("locationId"),
+		d.col("updatedAt"),
+		d.col("mergeStartedAt"),
+		d.col("partsDeletedAt"),
+	)
+	start := time.Now()
+	var stats CacheStats
+	if err := d.GetContext(ctx, &stats, d.Rebind(query), staleMergeThreshold); err != nil {
+		return nil, err
+	}
+	d.recordDBQuery(ctx, "cache_entries", start)
+	return &stats, nil
+}
+
 // DeleteCacheEntriesByLocationID deletes cache entries by location ID.
 func (d *DB) DeleteCacheEntriesByLocationID(ctx context.Context, locationID string) error {
 	query := fmt.Sprintf(`DELETE FROM cache_entries WHERE %s = ?`, d.col("locationId"))

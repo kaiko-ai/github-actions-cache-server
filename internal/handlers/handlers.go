@@ -90,7 +90,11 @@ func (h *Handler) Router() http.Handler {
 	r.Use(h.requestLogger)
 
 	// Utility routes
-	r.Get("/", h.handleRoot)
+	if h.config.UIEnabled {
+		r.Get("/", h.handleUIIndex)
+	} else {
+		r.Get("/", h.handleRoot)
+	}
 	r.Get("/health", h.handleHealth)
 	r.Get("/metrics", h.handleMetrics)
 
@@ -102,6 +106,13 @@ func (h *Handler) Router() http.Handler {
 	// Upload/Download routes
 	r.Put("/upload/{uploadId}", h.handleUpload)
 	r.Get("/download/{cacheEntryId}", h.handleDownload)
+
+	// Web UI API for cache entry management
+	if h.config.UIEnabled {
+		r.Get("/api/stats", h.handleStats)
+		r.Get("/api/cache-entries", h.handleListCacheEntries)
+		r.Delete("/api/cache-entries/{id}", h.handleDeleteCacheEntry)
+	}
 
 	// Catch-all proxy to GitHub results receiver
 	r.HandleFunc("/*", h.handleCatchAllProxy)

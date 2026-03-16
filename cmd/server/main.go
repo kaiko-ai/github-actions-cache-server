@@ -11,14 +11,32 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+
 	"github.com/falcosecurity/github-actions-cache-server/internal/config"
 	"github.com/falcosecurity/github-actions-cache-server/internal/server"
 )
 
 func main() {
+	rootCmd := &cobra.Command{
+		Use:   "cache-server",
+		Short: "GitHub Actions Cache Server",
+		Long:  "A self-hosted cache server compatible with the GitHub Actions caching protocol.",
+		RunE:  runServer,
+	}
+
+	config.RegisterFlags(rootCmd)
+
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func runServer(cmd *cobra.Command, args []string) error {
 	// Set up logging
 	logLevel := slog.LevelInfo
-	if os.Getenv("DEBUG") == "true" {
+	if viper.GetBool("debug") {
 		logLevel = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
@@ -27,14 +45,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := run(ctx, logger); err != nil {
-		logger.Error("server error", "error", err)
-		os.Exit(1)
-	}
-}
-
-func run(ctx context.Context, logger *slog.Logger) error {
-	// Load configuration
+	// Load configuration (reads from viper which merges flags + env vars)
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)

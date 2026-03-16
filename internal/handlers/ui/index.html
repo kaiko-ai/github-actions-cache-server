@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cache Server</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #1a1a2e; padding: 24px 32px; }
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+  .header h1 { font-size: 1.5rem; font-weight: 700; }
+  .header-badges { display: flex; gap: 8px; }
+  .badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 600; background: #e8eaed; color: #555; }
+
+  /* Stats cards */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .stat-card { background: #fff; border-radius: 10px; padding: 18px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border-left: 3px solid transparent; }
+  .stat-label { font-size: 0.75rem; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .stat-value { font-size: 1.6rem; font-weight: 700; color: #1a1a2e; }
+  .stat-sub { font-size: 0.75rem; color: #999; margin-top: 4px; }
+
+  /* Health section */
+  .section-title { font-size: 0.8rem; font-weight: 700; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  .health-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .health-card { background: #fff; border-radius: 10px; padding: 14px 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); display: flex; align-items: center; gap: 14px; border-left: 3px solid #d0d5dd; }
+  .health-card.ok { border-left-color: #22c55e; }
+  .health-card.warn { border-left-color: #f59e0b; }
+  .health-card.error { border-left-color: #ef4444; }
+  .health-icon { font-size: 1.3rem; width: 28px; text-align: center; flex-shrink: 0; }
+  .health-info { flex: 1; min-width: 0; }
+  .health-title { font-size: 0.8rem; font-weight: 600; color: #444; }
+  .health-detail { font-size: 0.7rem; color: #999; margin-top: 2px; }
+  .hidden { display: none; }
+
+  /* Toolbar */
+  .toolbar { display: flex; gap: 8px; margin-bottom: 16px; align-items: center; }
+  .toolbar input[type="text"] { padding: 8px 12px; border: 1px solid #d0d5dd; border-radius: 8px; font-size: 0.875rem; width: 320px; background: #fff; outline: none; transition: border-color 0.15s; }
+  .toolbar input[type="text"]:focus { border-color: #4f6ef7; box-shadow: 0 0 0 3px rgba(79,110,247,0.1); }
+  .toolbar button { padding: 8px 16px; border: 1px solid #d0d5dd; border-radius: 8px; background: #fff; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.15s; }
+  .toolbar button:hover { background: #f5f5f5; border-color: #b0b5bd; }
+
+  /* Table */
+  .table-wrap { background: #fff; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid #f0f0f0; font-size: 0.85rem; }
+  th { background: #fafbfc; font-weight: 600; color: #666; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.4px; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f8f9ff; }
+  .status { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.3px; }
+  .status.merged { background: #dcfce7; color: #166534; }
+  .status.unmerged { background: #fef9c3; color: #854d0e; }
+  .btn-delete { background: none; border: 1px solid #fca5a5; color: #dc2626; padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 500; transition: all 0.15s; }
+  .btn-delete:hover { background: #dc2626; color: #fff; border-color: #dc2626; }
+  .pagination { display: flex; gap: 8px; align-items: center; padding: 12px 16px; border-top: 1px solid #f0f0f0; font-size: 0.8rem; color: #888; }
+  .pagination button { padding: 5px 14px; border: 1px solid #d0d5dd; border-radius: 6px; background: #fff; cursor: pointer; font-size: 0.8rem; font-weight: 500; }
+  .pagination button:disabled { opacity: 0.35; cursor: default; }
+  .pagination button:hover:not(:disabled) { background: #f5f5f5; }
+  .empty { text-align: center; padding: 48px; color: #aaa; font-size: 0.9rem; }
+  .mono { font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', monospace; font-size: 0.8rem; }
+  .key-cell { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .version-cell { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .loading { color: #aaa; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Cache Server</h1>
+  <div class="header-badges">
+    <span class="badge" id="badgeStorage">-</span>
+    <span class="badge" id="badgeDB">-</span>
+    <span class="badge" id="badgeCleanup">-</span>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat-card">
+    <div class="stat-label">Total Entries</div>
+    <div class="stat-value" id="statTotal">-</div>
+    <div class="stat-sub" id="statAge"></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Merged</div>
+    <div class="stat-value" id="statMerged">-</div>
+    <div class="stat-sub">Ready to serve</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Unmerged</div>
+    <div class="stat-value" id="statUnmerged">-</div>
+    <div class="stat-sub">Pending merge on download</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Active Uploads</div>
+    <div class="stat-value" id="statUploads">-</div>
+    <div class="stat-sub">In progress right now</div>
+  </div>
+</div>
+
+<div id="healthSection" class="hidden">
+  <div class="section-title">Health</div>
+  <div class="health-cards" id="healthCards"></div>
+</div>
+
+<div class="toolbar">
+  <input type="text" id="searchInput" placeholder="Filter by key prefix..." />
+  <button onclick="loadEntries(0)">Search</button>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Version</th>
+        <th>Updated</th>
+        <th>Last Downloaded</th>
+        <th>Parts</th>
+        <th>Status</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="entriesBody">
+      <tr><td colspan="7" class="empty loading">Loading...</td></tr>
+    </tbody>
+  </table>
+  <div class="pagination">
+    <button id="prevBtn" onclick="prevPage()" disabled>Prev</button>
+    <span id="pageInfo"></span>
+    <button id="nextBtn" onclick="nextPage()" disabled>Next</button>
+  </div>
+</div>
+
+<script>
+  var LIMIT = 50;
+  var currentOffset = 0;
+  var totalEntries = 0;
+
+  function formatTime(ms) {
+    if (!ms) return '-';
+    return new Date(ms).toLocaleString();
+  }
+
+  function timeAgo(ms) {
+    if (!ms) return '';
+    var seconds = Math.floor((Date.now() - ms) / 1000);
+    if (seconds < 60) return 'just now';
+    var minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return minutes + 'm ago';
+    var hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + 'h ago';
+    var days = Math.floor(hours / 24);
+    return days + 'd ago';
+  }
+
+  function esc(s) {
+    var el = document.createElement('span');
+    el.textContent = s;
+    return el.innerHTML;
+  }
+
+  function renderHealth(s) {
+    var cards = [];
+
+    // Stale merges — error level
+    if (s.staleMerges > 0) {
+      cards.push({ level: 'error', icon: '\u26A0', title: s.staleMerges + ' stale merge' + (s.staleMerges > 1 ? 's' : ''), detail: 'Merges stuck for >15 min. May need investigation.' });
+    }
+
+    // Currently merging — info when present
+    if (s.currentlyMerging > 0) {
+      cards.push({ level: 'ok', icon: '\u21BB', title: s.currentlyMerging + ' currently merging', detail: 'Parts being merged into single files.' });
+    }
+
+    // Orphaned locations — warning level
+    if (s.orphanedLocations > 0) {
+      cards.push({ level: 'warn', icon: '\u2327', title: s.orphanedLocations + ' orphaned location' + (s.orphanedLocations > 1 ? 's' : ''), detail: 'Storage without cache entry. Will be cleaned up.' });
+    }
+
+    // Parts cleanup backlog — info when large
+    if (s.partsCleanupPending > 0) {
+      var level = s.partsCleanupPending > 50 ? 'warn' : 'ok';
+      cards.push({ level: level, icon: '\u2702', title: s.partsCleanupPending + ' pending parts cleanup', detail: 'Merged entries with parts not yet deleted.' });
+    }
+
+    var section = document.getElementById('healthSection');
+    var container = document.getElementById('healthCards');
+
+    if (cards.length === 0) {
+      // All clear
+      section.classList.remove('hidden');
+      container.innerHTML = '<div class="health-card ok"><div class="health-icon">\u2713</div><div class="health-info"><div class="health-title">All clear</div><div class="health-detail">No issues detected.</div></div></div>';
+      return;
+    }
+
+    section.classList.remove('hidden');
+    container.innerHTML = cards.map(function(c) {
+      return '<div class="health-card ' + c.level + '"><div class="health-icon">' + c.icon + '</div><div class="health-info"><div class="health-title">' + c.title + '</div><div class="health-detail">' + c.detail + '</div></div></div>';
+    }).join('');
+  }
+
+  async function loadStats() {
+    try {
+      var resp = await fetch('/api/stats');
+      var s = await resp.json();
+
+      document.getElementById('statTotal').textContent = s.totalEntries.toLocaleString();
+      document.getElementById('statMerged').textContent = s.mergedEntries.toLocaleString();
+      document.getElementById('statUnmerged').textContent = s.unmergedEntries.toLocaleString();
+      document.getElementById('statUploads').textContent = s.activeUploads.toLocaleString();
+
+      if (s.oldestEntryAt && s.newestEntryAt) {
+        document.getElementById('statAge').textContent =
+          'Oldest: ' + timeAgo(s.oldestEntryAt) + ' \u00B7 Newest: ' + timeAgo(s.newestEntryAt);
+      } else {
+        document.getElementById('statAge').textContent = 'No entries yet';
+      }
+
+      document.getElementById('badgeStorage').textContent = 'Storage: ' + s.storageDriver;
+      document.getElementById('badgeDB').textContent = 'DB: ' + s.dbDriver;
+      document.getElementById('badgeCleanup').textContent = s.cleanupDisabled
+        ? 'Cleanup: disabled'
+        : 'Cleanup: ' + s.cleanupDays + 'd';
+
+      renderHealth(s);
+    } catch (e) {
+      // Stats are non-critical, silently fail
+    }
+  }
+
+  function renderEntries(entries) {
+    var tbody = document.getElementById('entriesBody');
+    if (entries.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No cache entries found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = entries.map(function(e) {
+      return '<tr>' +
+        '<td class="key-cell mono" title="' + esc(e.key) + '">' + esc(e.key) + '</td>' +
+        '<td class="version-cell mono" title="' + esc(e.version) + '">' + esc(e.version) + '</td>' +
+        '<td>' + formatTime(e.updatedAt) + '</td>' +
+        '<td>' + (e.lastDownloadedAt ? formatTime(e.lastDownloadedAt) + ' <span style="color:#aaa">(' + timeAgo(e.lastDownloadedAt) + ')</span>' : '<span style="color:#ccc">Never</span>') + '</td>' +
+        '<td class="mono">' + e.partCount + '</td>' +
+        '<td><span class="status ' + (e.merged ? 'merged' : 'unmerged') + '">' + (e.merged ? 'Merged' : 'Unmerged') + '</span></td>' +
+        '<td><button class="btn-delete" onclick="deleteEntry(\'' + esc(e.id) + '\')">Delete</button></td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function updatePagination() {
+    var start = totalEntries === 0 ? 0 : currentOffset + 1;
+    var end = Math.min(currentOffset + LIMIT, totalEntries);
+    document.getElementById('pageInfo').textContent = start + '-' + end + ' of ' + totalEntries;
+    document.getElementById('prevBtn').disabled = currentOffset === 0;
+    document.getElementById('nextBtn').disabled = currentOffset + LIMIT >= totalEntries;
+  }
+
+  async function loadEntries(offset) {
+    currentOffset = offset;
+    var key = document.getElementById('searchInput').value;
+    var params = new URLSearchParams({ limit: LIMIT, offset: offset });
+    if (key) params.set('key', key);
+    try {
+      var resp = await fetch('/api/cache-entries?' + params);
+      var data = await resp.json();
+      totalEntries = data.total;
+      renderEntries(data.entries);
+      updatePagination();
+    } catch (err) {
+      document.getElementById('entriesBody').innerHTML = '<tr><td colspan="7" class="empty">Failed to load entries.</td></tr>';
+    }
+  }
+
+  function prevPage() { if (currentOffset - LIMIT >= 0) loadEntries(currentOffset - LIMIT); }
+  function nextPage() { if (currentOffset + LIMIT < totalEntries) loadEntries(currentOffset + LIMIT); }
+
+  async function deleteEntry(id) {
+    if (!confirm('Delete this cache entry? This cannot be undone.')) return;
+    try {
+      var resp = await fetch('/api/cache-entries/' + id, { method: 'DELETE' });
+      if (resp.ok) {
+        loadEntries(currentOffset);
+        loadStats();
+      } else {
+        var data = await resp.json();
+        alert('Failed to delete: ' + (data.statusMessage || resp.statusText));
+      }
+    } catch (err) {
+      alert('Failed to delete: ' + err.message);
+    }
+  }
+
+  document.getElementById('searchInput').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') loadEntries(0);
+  });
+
+  loadStats();
+  loadEntries(0);
+</script>
+</body>
+</html>

@@ -7,7 +7,7 @@ actions-runner/
 benchmark.csv
 
 # Go binaries and build output
-server
+/server
 *.exe
 *.exe~
 *.dll

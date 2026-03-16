@@ -1,12 +1,14 @@
-// Package config handles environment-based configuration for the cache server.
+// Package config handles configuration for the cache server via CLI flags and environment variables.
 package config
 
 import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
-	"strconv"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 // Config holds all configuration for the cache server.
@@ -60,6 +62,7 @@ type Config struct {
 	APIBaseURL     string
 	Port           int
 	MetricsEnabled bool
+	UIEnabled      bool
 	Debug          bool
 	Benchmark      bool
 
@@ -69,59 +72,120 @@ type Config struct {
 	EnableDirectDownloads     bool
 }
 
-// Load reads configuration from environment variables.
+// RegisterFlags registers all CLI flags on the given cobra command and sets up
+// viper to read from both flags and environment variables. Env vars use
+// SCREAMING_SNAKE_CASE (e.g. --storage-driver ↔ STORAGE_DRIVER).
+func RegisterFlags(cmd *cobra.Command) {
+	f := cmd.Flags()
+
+	// Storage
+	f.String("storage-driver", "filesystem", "Storage driver (filesystem, s3, gcs)")
+	f.Int("storage-high-water-mark", 1048576, "Buffer size for streaming in bytes")
+	f.String("storage-filesystem-path", ".data/storage/filesystem", "Filesystem storage path")
+
+	// S3
+	f.String("storage-s3-bucket", "", "S3 bucket name")
+	f.String("aws-region", "us-east-1", "AWS region")
+	f.String("aws-endpoint-url", "", "AWS endpoint URL (for S3-compatible stores)")
+	f.String("aws-access-key-id", "", "AWS access key ID")
+	f.String("aws-secret-access-key", "", "AWS secret access key")
+
+	// GCS
+	f.String("storage-gcs-bucket", "", "GCS bucket name")
+	f.String("storage-gcs-service-account-key", "", "GCS service account key JSON")
+	f.String("storage-gcs-endpoint", "", "GCS endpoint (for emulators)")
+
+	// Database
+	f.String("db-driver", "sqlite", "Database driver (sqlite, postgres, mysql)")
+	f.Int("db-max-open-conns", 10, "Max open database connections")
+	f.Int("db-max-idle-conns", 5, "Max idle database connections")
+	f.Int("db-conn-max-lifetime-seconds", 3600, "Database connection max lifetime in seconds")
+
+	// SQLite
+	f.String("db-sqlite-path", ".data/sqlite.db", "SQLite database path")
+
+	// PostgreSQL
+	f.String("db-postgres-url", "", "PostgreSQL connection URL")
+	f.String("db-postgres-host", "", "PostgreSQL host")
+	f.Int("db-postgres-port", 5432, "PostgreSQL port")
+	f.String("db-postgres-user", "", "PostgreSQL user")
+	f.String("db-postgres-password", "", "PostgreSQL password")
+	f.String("db-postgres-database", "", "PostgreSQL database name")
+
+	// MySQL
+	f.String("db-mysql-host", "", "MySQL host")
+	f.Int("db-mysql-port", 3306, "MySQL port")
+	f.String("db-mysql-user", "", "MySQL user")
+	f.String("db-mysql-password", "", "MySQL password")
+	f.String("db-mysql-database", "", "MySQL database name")
+
+	// Server
+	f.String("api-base-url", "http://localhost:3000", "Public base URL for the cache server")
+	f.Int("port", 3000, "HTTP listen port")
+	f.Bool("metrics-enabled", false, "Enable Prometheus metrics endpoint")
+	f.Bool("ui-enabled", true, "Enable web UI for cache management")
+	f.Bool("debug", false, "Enable debug logging")
+	f.Bool("benchmark", false, "Enable benchmark mode")
+
+	// Cache settings
+	f.Int("cache-cleanup-older-than-days", 90, "Delete cache entries older than N days")
+	f.Bool("disable-cleanup-jobs", false, "Disable all scheduled cleanup jobs")
+	f.Bool("enable-direct-downloads", false, "Enable signed direct download URLs")
+
+	// Wire up viper: flags → viper ← env vars
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+	viper.BindPFlags(f)
+}
+
+// Load reads configuration from viper (which merges CLI flags and env vars).
+// RegisterFlags must be called before Load.
 func Load() (*Config, error) {
 	cfg := &Config{
-		// Storage defaults
-		StorageDriver:         getEnvOrDefault("STORAGE_DRIVER", "filesystem"),
-		StorageHighWaterMark:  getEnvIntOrDefault("STORAGE_HIGH_WATER_MARK", 1048576),
-		StorageFilesystemPath: getEnvOrDefault("STORAGE_FILESYSTEM_PATH", ".data/storage/filesystem"),
+		StorageDriver:        viper.GetString("storage-driver"),
+		StorageHighWaterMark: viper.GetInt("storage-high-water-mark"),
+		StorageFilesystemPath: viper.GetString("storage-filesystem-path"),
 
-		// S3 defaults
-		StorageS3Bucket:    os.Getenv("STORAGE_S3_BUCKET"),
-		AWSRegion:          getEnvOrDefault("AWS_REGION", "us-east-1"),
-		AWSEndpointURL:     os.Getenv("AWS_ENDPOINT_URL"),
-		AWSAccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
-		AWSSecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		StorageS3Bucket:    viper.GetString("storage-s3-bucket"),
+		AWSRegion:          viper.GetString("aws-region"),
+		AWSEndpointURL:     viper.GetString("aws-endpoint-url"),
+		AWSAccessKeyID:     viper.GetString("aws-access-key-id"),
+		AWSSecretAccessKey: viper.GetString("aws-secret-access-key"),
 
-		// GCS defaults
-		StorageGCSBucket:            os.Getenv("STORAGE_GCS_BUCKET"),
-		StorageGCSServiceAccountKey: os.Getenv("STORAGE_GCS_SERVICE_ACCOUNT_KEY"),
-		StorageGCSEndpoint:          os.Getenv("STORAGE_GCS_ENDPOINT"),
+		StorageGCSBucket:            viper.GetString("storage-gcs-bucket"),
+		StorageGCSServiceAccountKey: viper.GetString("storage-gcs-service-account-key"),
+		StorageGCSEndpoint:          viper.GetString("storage-gcs-endpoint"),
 
-		// Database defaults
-		DBDriver:                 getEnvOrDefault("DB_DRIVER", "sqlite"),
-		DBSqlitePath:             getEnvOrDefault("DB_SQLITE_PATH", ".data/sqlite.db"),
-		DBMaxOpenConns:           getEnvIntOrDefault("DB_MAX_OPEN_CONNS", 10),
-		DBMaxIdleConns:           getEnvIntOrDefault("DB_MAX_IDLE_CONNS", 5),
-		DBConnMaxLifetimeSeconds: getEnvIntOrDefault("DB_CONN_MAX_LIFETIME_SECONDS", 3600),
+		DBDriver:                 viper.GetString("db-driver"),
+		DBMaxOpenConns:           viper.GetInt("db-max-open-conns"),
+		DBMaxIdleConns:           viper.GetInt("db-max-idle-conns"),
+		DBConnMaxLifetimeSeconds: viper.GetInt("db-conn-max-lifetime-seconds"),
 
-		// PostgreSQL
-		DBPostgresURL:      os.Getenv("DB_POSTGRES_URL"),
-		DBPostgresHost:     os.Getenv("DB_POSTGRES_HOST"),
-		DBPostgresPort:     getEnvIntOrDefault("DB_POSTGRES_PORT", 5432),
-		DBPostgresUser:     os.Getenv("DB_POSTGRES_USER"),
-		DBPostgresPassword: os.Getenv("DB_POSTGRES_PASSWORD"),
-		DBPostgresDatabase: os.Getenv("DB_POSTGRES_DATABASE"),
+		DBSqlitePath: viper.GetString("db-sqlite-path"),
 
-		// MySQL
-		DBMysqlHost:     os.Getenv("DB_MYSQL_HOST"),
-		DBMysqlPort:     getEnvIntOrDefault("DB_MYSQL_PORT", 3306),
-		DBMysqlUser:     os.Getenv("DB_MYSQL_USER"),
-		DBMysqlPassword: os.Getenv("DB_MYSQL_PASSWORD"),
-		DBMysqlDatabase: os.Getenv("DB_MYSQL_DATABASE"),
+		DBPostgresURL:      viper.GetString("db-postgres-url"),
+		DBPostgresHost:     viper.GetString("db-postgres-host"),
+		DBPostgresPort:     viper.GetInt("db-postgres-port"),
+		DBPostgresUser:     viper.GetString("db-postgres-user"),
+		DBPostgresPassword: viper.GetString("db-postgres-password"),
+		DBPostgresDatabase: viper.GetString("db-postgres-database"),
 
-		// Server
-		APIBaseURL:     os.Getenv("API_BASE_URL"),
-		Port:           getEnvIntOrDefault("PORT", 3000),
-		MetricsEnabled: getEnvBoolOrDefault("METRICS_ENABLED", false),
-		Debug:          getEnvBoolOrDefault("DEBUG", false),
-		Benchmark:      getEnvBoolOrDefault("BENCHMARK", false),
+		DBMysqlHost:     viper.GetString("db-mysql-host"),
+		DBMysqlPort:     viper.GetInt("db-mysql-port"),
+		DBMysqlUser:     viper.GetString("db-mysql-user"),
+		DBMysqlPassword: viper.GetString("db-mysql-password"),
+		DBMysqlDatabase: viper.GetString("db-mysql-database"),
 
-		// Cache settings
-		CacheCleanupOlderThanDays: getEnvIntOrDefault("CACHE_CLEANUP_OLDER_THAN_DAYS", 90),
-		DisableCleanupJobs:        getEnvBoolOrDefault("DISABLE_CLEANUP_JOBS", false),
-		EnableDirectDownloads:     getEnvBoolOrDefault("ENABLE_DIRECT_DOWNLOADS", false),
+		APIBaseURL:     viper.GetString("api-base-url"),
+		Port:           viper.GetInt("port"),
+		MetricsEnabled: viper.GetBool("metrics-enabled"),
+		UIEnabled:      viper.GetBool("ui-enabled"),
+		Debug:          viper.GetBool("debug"),
+		Benchmark:      viper.GetBool("benchmark"),
+
+		CacheCleanupOlderThanDays: viper.GetInt("cache-cleanup-older-than-days"),
+		DisableCleanupJobs:        viper.GetBool("disable-cleanup-jobs"),
+		EnableDirectDownloads:     viper.GetBool("enable-direct-downloads"),
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -135,7 +199,7 @@ func Load() (*Config, error) {
 func (c *Config) Validate() error {
 	// Validate API base URL
 	if c.APIBaseURL == "" {
-		return errors.New("API_BASE_URL is required")
+		c.APIBaseURL = "http://localhost:3000"
 	}
 	if _, err := url.Parse(c.APIBaseURL); err != nil {
 		return fmt.Errorf("invalid API_BASE_URL: %w", err)
@@ -206,29 +270,4 @@ func (c *Config) GetMySQLConnectionString() string {
 		"%s:%s@tcp(%s:%d)/%s?parseTime=true",
 		c.DBMysqlUser, c.DBMysqlPassword, c.DBMysqlHost, c.DBMysqlPort, c.DBMysqlDatabase,
 	)
-}
-
-func getEnvOrDefault(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-func getEnvIntOrDefault(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		if intValue, err := strconv.Atoi(value); err == nil {
-			return intValue
-		}
-	}
-	return defaultValue
-}
-
-func getEnvBoolOrDefault(key string, defaultValue bool) bool {
-	if value := os.Getenv(key); value != "" {
-		if boolValue, err := strconv.ParseBool(value); err == nil {
-			return boolValue
-		}
-	}
-	return defaultValue
 }
