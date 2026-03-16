@@ -142,8 +142,8 @@ func RegisterFlags(cmd *cobra.Command) {
 // RegisterFlags must be called before Load.
 func Load() (*Config, error) {
 	cfg := &Config{
-		StorageDriver:        viper.GetString("storage-driver"),
-		StorageHighWaterMark: viper.GetInt("storage-high-water-mark"),
+		StorageDriver:         viper.GetString("storage-driver"),
+		StorageHighWaterMark:  viper.GetInt("storage-high-water-mark"),
 		StorageFilesystemPath: viper.GetString("storage-filesystem-path"),
 
 		StorageS3Bucket:    viper.GetString("storage-s3-bucket"),
