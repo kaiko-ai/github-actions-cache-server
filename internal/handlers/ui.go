@@ -39,6 +39,7 @@ type cacheEntryJSON struct {
 	LocationID       string `json:"locationId"`
 	FolderName       string `json:"folderName"`
 	PartCount        int    `json:"partCount"`
+	SizeBytes        int64  `json:"sizeBytes"`
 	Merged           bool   `json:"merged"`
 	LastDownloadedAt *int64 `json:"lastDownloadedAt"`
 }
@@ -82,6 +83,7 @@ func (h *Handler) handleListCacheEntries(w http.ResponseWriter, r *http.Request)
 			LocationID: e.LocationID,
 			FolderName: e.FolderName,
 			PartCount:  e.PartCount,
+			SizeBytes:  e.SizeBytes,
 			Merged:     e.MergedAt.Valid,
 		}
 		if e.LastDownloadedAt.Valid {
@@ -101,6 +103,8 @@ func (h *Handler) handleListCacheEntries(w http.ResponseWriter, r *http.Request)
 
 type statsResponse struct {
 	TotalEntries        int    `json:"totalEntries"`
+	TotalSizeBytes      int64  `json:"totalSizeBytes"`
+	MaxCacheSizeBytes   int64  `json:"maxCacheSizeBytes"`
 	MergedEntries       int    `json:"mergedEntries"`
 	UnmergedEntries     int    `json:"unmergedEntries"`
 	ActiveUploads       int    `json:"activeUploads"`
@@ -129,6 +133,8 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	h.writeJSON(w, http.StatusOK, statsResponse{
 		TotalEntries:        stats.TotalEntries,
+		TotalSizeBytes:      stats.TotalSizeBytes,
+		MaxCacheSizeBytes:   h.config.MaxCacheSizeBytes,
 		MergedEntries:       stats.MergedEntries,
 		UnmergedEntries:     stats.UnmergedEntries,
 		ActiveUploads:       stats.ActiveUploads,

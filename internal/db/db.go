@@ -47,6 +47,7 @@ type StorageLocation struct {
 	ID               string        `db:"id"`
 	FolderName       string        `db:"folderName"`
 	PartCount        int           `db:"partCount"`
+	SizeBytes        int64         `db:"sizeBytes"`
 	MergeStartedAt   sql.NullInt64 `db:"mergeStartedAt"`
 	MergedAt         sql.NullInt64 `db:"mergedAt"`
 	PartsDeletedAt   sql.NullInt64 `db:"partsDeletedAt"`
@@ -331,10 +332,10 @@ func (d *DB) GetUploadByKeyVersion(ctx context.Context, key, version string) (*U
 
 // CreateStorageLocation creates a new storage location.
 func (d *DB) CreateStorageLocation(ctx context.Context, loc *StorageLocation) error {
-	query := fmt.Sprintf(`INSERT INTO storage_locations (id, %s, %s) VALUES (?, ?, ?)`,
-		d.col("folderName"), d.col("partCount"))
+	query := fmt.Sprintf(`INSERT INTO storage_locations (id, %s, %s, %s) VALUES (?, ?, ?, ?)`,
+		d.col("folderName"), d.col("partCount"), d.col("sizeBytes"))
 	start := time.Now()
-	_, err := d.ExecContext(ctx, d.Rebind(query), loc.ID, loc.FolderName, loc.PartCount)
+	_, err := d.ExecContext(ctx, d.Rebind(query), loc.ID, loc.FolderName, loc.PartCount, loc.SizeBytes)
 	d.recordDBQuery(ctx, "storage_locations", start)
 	return err
 }
@@ -342,8 +343,8 @@ func (d *DB) CreateStorageLocation(ctx context.Context, loc *StorageLocation) er
 // GetStorageLocation retrieves a storage location by ID.
 func (d *DB) GetStorageLocation(ctx context.Context, id string) (*StorageLocation, error) {
 	var loc StorageLocation
-	query := fmt.Sprintf(`SELECT id, %s, %s, %s, %s, %s, %s FROM storage_locations WHERE id = ?`,
-		d.col("folderName"), d.col("partCount"), d.col("mergeStartedAt"),
+	query := fmt.Sprintf(`SELECT id, %s, %s, %s, %s, %s, %s, %s FROM storage_locations WHERE id = ?`,
+		d.col("folderName"), d.col("partCount"), d.col("sizeBytes"), d.col("mergeStartedAt"),
 		d.col("mergedAt"), d.col("partsDeletedAt"), d.col("lastDownloadedAt"))
 	start := time.Now()
 	err := d.GetContext(ctx, &loc, d.Rebind(query), id)
@@ -505,10 +506,10 @@ func (d *DB) CompleteUpload(ctx context.Context, uploadID int64, cacheEntry *Cac
 	d.recordDBQuery(ctx, "uploads", start)
 
 	// Create storage location
-	createLocQuery := fmt.Sprintf(`INSERT INTO storage_locations (id, %s, %s) VALUES (?, ?, ?)`,
-		d.col("folderName"), d.col("partCount"))
+	createLocQuery := fmt.Sprintf(`INSERT INTO storage_locations (id, %s, %s, %s) VALUES (?, ?, ?, ?)`,
+		d.col("folderName"), d.col("partCount"), d.col("sizeBytes"))
 	start = time.Now()
-	if _, err := tx.ExecContext(ctx, d.Rebind(createLocQuery), storageLocation.ID, storageLocation.FolderName, storageLocation.PartCount); err != nil {
+	if _, err := tx.ExecContext(ctx, d.Rebind(createLocQuery), storageLocation.ID, storageLocation.FolderName, storageLocation.PartCount, storageLocation.SizeBytes); err != nil {
 		return nil, err
 	}
 	d.recordDBQuery(ctx, "storage_locations", start)
@@ -524,8 +525,8 @@ func (d *DB) CompleteUpload(ctx context.Context, uploadID int64, cacheEntry *Cac
 	if err == nil {
 		// Existing entry found - get the old location's folder name for cleanup
 		var oldLocation StorageLocation
-		getOldLocQuery := fmt.Sprintf(`SELECT id, %s, %s, %s, %s, %s, %s FROM storage_locations WHERE id = ?`,
-			d.col("folderName"), d.col("partCount"), d.col("mergeStartedAt"),
+		getOldLocQuery := fmt.Sprintf(`SELECT id, %s, %s, %s, %s, %s, %s, %s FROM storage_locations WHERE id = ?`,
+			d.col("folderName"), d.col("partCount"), d.col("sizeBytes"), d.col("mergeStartedAt"),
 			d.col("mergedAt"), d.col("partsDeletedAt"), d.col("lastDownloadedAt"))
 		start = time.Now()
 		if err := tx.GetContext(ctx, &oldLocation, d.Rebind(getOldLocQuery), existingEntry.LocationID); err == nil {
@@ -588,9 +589,9 @@ func (d *DB) GetStaleUploads(ctx context.Context, olderThan int64, limit int) ([
 // GetMergedStorageLocationsForPartsCleanup retrieves storage locations ready for parts cleanup.
 func (d *DB) GetMergedStorageLocationsForPartsCleanup(ctx context.Context, limit int) ([]*StorageLocation, error) {
 	var locs []*StorageLocation
-	query := fmt.Sprintf(`SELECT id, %s, %s, %s, %s, %s, %s
+	query := fmt.Sprintf(`SELECT id, %s, %s, %s, %s, %s, %s, %s
 		FROM storage_locations WHERE %s IS NOT NULL AND %s IS NULL LIMIT ?`,
-		d.col("folderName"), d.col("partCount"), d.col("mergeStartedAt"),
+		d.col("folderName"), d.col("partCount"), d.col("sizeBytes"), d.col("mergeStartedAt"),
 		d.col("mergedAt"), d.col("partsDeletedAt"), d.col("lastDownloadedAt"),
 		d.col("mergedAt"), d.col("partsDeletedAt"))
 	start := time.Now()
@@ -615,16 +616,18 @@ func (d *DB) GetStaleMerges(ctx context.Context, olderThan int64) (int64, error)
 }
 
 // GetOldCacheEntries retrieves cache entries not downloaded recently.
+// Uses COALESCE to fall back to updatedAt for entries that were never downloaded,
+// so they are not immortal.
 func (d *DB) GetOldCacheEntries(ctx context.Context, olderThan int64, limit int) ([]*StorageLocation, error) {
 	var locs []*StorageLocation
-	query := fmt.Sprintf(`SELECT sl.id, sl.%[1]s, sl.%[2]s, sl.%[3]s, sl.%[4]s, sl.%[5]s, sl.%[6]s
+	query := fmt.Sprintf(`SELECT sl.id, sl.%[1]s, sl.%[2]s, sl.%[3]s, sl.%[4]s, sl.%[5]s, sl.%[6]s, sl.%[8]s
 		FROM storage_locations sl
 		INNER JOIN cache_entries ce ON ce.%[7]s = sl.id
-		WHERE sl.%[6]s IS NOT NULL AND sl.%[6]s < ?
+		WHERE COALESCE(sl.%[6]s, ce.%[9]s) < ?
 		LIMIT ?`,
 		d.col("folderName"), d.col("partCount"), d.col("mergeStartedAt"),
 		d.col("mergedAt"), d.col("partsDeletedAt"), d.col("lastDownloadedAt"),
-		d.col("locationId"))
+		d.col("locationId"), d.col("sizeBytes"), d.col("updatedAt"))
 	start := time.Now()
 	err := d.SelectContext(ctx, &locs, d.Rebind(query), olderThan, limit)
 	d.recordDBQuery(ctx, "storage_locations", start)
@@ -634,12 +637,12 @@ func (d *DB) GetOldCacheEntries(ctx context.Context, olderThan int64, limit int)
 // GetOrphanedStorageLocations retrieves storage locations without cache entries.
 func (d *DB) GetOrphanedStorageLocations(ctx context.Context, limit int) ([]*StorageLocation, error) {
 	var locs []*StorageLocation
-	query := fmt.Sprintf(`SELECT sl.id, sl.%[1]s, sl.%[2]s, sl.%[3]s, sl.%[4]s, sl.%[5]s, sl.%[6]s
+	query := fmt.Sprintf(`SELECT sl.id, sl.%[1]s, sl.%[2]s, sl.%[3]s, sl.%[4]s, sl.%[5]s, sl.%[6]s, sl.%[7]s
 		FROM storage_locations sl
-		LEFT JOIN cache_entries ce ON ce.%[7]s = sl.id
+		LEFT JOIN cache_entries ce ON ce.%[8]s = sl.id
 		WHERE ce.id IS NULL
 		LIMIT ?`,
-		d.col("folderName"), d.col("partCount"), d.col("mergeStartedAt"),
+		d.col("folderName"), d.col("partCount"), d.col("sizeBytes"), d.col("mergeStartedAt"),
 		d.col("mergedAt"), d.col("partsDeletedAt"), d.col("lastDownloadedAt"),
 		d.col("locationId"))
 	start := time.Now()
@@ -657,6 +660,7 @@ type CacheEntryWithLocation struct {
 	LocationID       string        `db:"locationId" json:"locationId"`
 	FolderName       string        `db:"folderName" json:"folderName"`
 	PartCount        int           `db:"partCount" json:"partCount"`
+	SizeBytes        int64         `db:"sizeBytes" json:"sizeBytes"`
 	MergedAt         sql.NullInt64 `db:"mergedAt" json:"-"`
 	LastDownloadedAt sql.NullInt64 `db:"lastDownloadedAt" json:"-"`
 }
@@ -689,9 +693,9 @@ func (d *DB) ListCacheEntries(ctx context.Context, keyPrefix string, limit, offs
 	// Select page
 	selectQuery := fmt.Sprintf(
 		`SELECT ce.id, ce.%[1]s, ce.version, ce.%[2]s, ce.%[3]s,
-			sl.%[4]s, sl.%[5]s, sl.%[6]s, sl.%[7]s
+			sl.%[4]s, sl.%[5]s, sl.%[6]s, sl.%[7]s, sl.%[8]s
 		FROM cache_entries ce
-		INNER JOIN storage_locations sl ON sl.id = ce.%[3]s%[8]s
+		INNER JOIN storage_locations sl ON sl.id = ce.%[3]s%[9]s
 		ORDER BY ce.%[2]s DESC
 		LIMIT ? OFFSET ?`,
 		d.keyCol(),
@@ -699,6 +703,7 @@ func (d *DB) ListCacheEntries(ctx context.Context, keyPrefix string, limit, offs
 		d.col("locationId"),
 		d.col("folderName"),
 		d.col("partCount"),
+		d.col("sizeBytes"),
 		d.col("mergedAt"),
 		d.col("lastDownloadedAt"),
 		where,
@@ -717,6 +722,7 @@ func (d *DB) ListCacheEntries(ctx context.Context, keyPrefix string, limit, offs
 // CacheStats holds aggregate statistics about the cache.
 type CacheStats struct {
 	TotalEntries        int   `db:"total_entries" json:"totalEntries"`
+	TotalSizeBytes      int64 `db:"total_size_bytes" json:"totalSizeBytes"`
 	MergedEntries       int   `db:"merged_entries" json:"mergedEntries"`
 	UnmergedEntries     int   `db:"unmerged_entries" json:"unmergedEntries"`
 	ActiveUploads       int   `db:"active_uploads" json:"activeUploads"`
@@ -732,6 +738,8 @@ type CacheStats struct {
 func (d *DB) GetCacheStats(ctx context.Context, staleMergeThreshold int64) (*CacheStats, error) {
 	query := fmt.Sprintf(`SELECT
 		(SELECT COUNT(*) FROM cache_entries) AS total_entries,
+		COALESCE((SELECT SUM(%[6]s) FROM storage_locations sl3
+			INNER JOIN cache_entries ce3 ON ce3.%[2]s = sl3.id), 0) AS total_size_bytes,
 		(SELECT COUNT(*) FROM storage_locations WHERE %[1]s IS NOT NULL) AS merged_entries,
 		(SELECT COUNT(*) FROM storage_locations sl
 			INNER JOIN cache_entries ce ON ce.%[2]s = sl.id
@@ -753,6 +761,7 @@ func (d *DB) GetCacheStats(ctx context.Context, staleMergeThreshold int64) (*Cac
 		d.col("updatedAt"),
 		d.col("mergeStartedAt"),
 		d.col("partsDeletedAt"),
+		d.col("sizeBytes"),
 	)
 	start := time.Now()
 	var stats CacheStats
@@ -761,6 +770,43 @@ func (d *DB) GetCacheStats(ctx context.Context, staleMergeThreshold int64) (*Cac
 	}
 	d.recordDBQuery(ctx, "cache_entries", start)
 	return &stats, nil
+}
+
+// GetTotalCacheSize returns the total size in bytes of all cache entries.
+func (d *DB) GetTotalCacheSize(ctx context.Context) (int64, error) {
+	query := fmt.Sprintf(`SELECT COALESCE(SUM(sl.%s), 0) FROM storage_locations sl
+		INNER JOIN cache_entries ce ON ce.%s = sl.id`,
+		d.col("sizeBytes"), d.col("locationId"))
+	start := time.Now()
+	var total int64
+	err := d.GetContext(ctx, &total, d.Rebind(query))
+	d.recordDBQuery(ctx, "storage_locations", start)
+	return total, err
+}
+
+// LRUCacheEntry represents a cache entry eligible for LRU eviction.
+type LRUCacheEntry struct {
+	EntryID    string `db:"entryId"`
+	LocationID string `db:"locationId"`
+	FolderName string `db:"folderName"`
+	SizeBytes  int64  `db:"sizeBytes"`
+}
+
+// GetLRUCacheEntries returns cache entries ordered by least recently used (oldest lastDownloadedAt first,
+// falling back to updatedAt for never-downloaded entries).
+func (d *DB) GetLRUCacheEntries(ctx context.Context, limit int) ([]*LRUCacheEntry, error) {
+	var entries []*LRUCacheEntry
+	query := fmt.Sprintf(`SELECT ce.id AS %[1]s, ce.%[2]s, sl.%[3]s, sl.%[4]s
+		FROM cache_entries ce
+		INNER JOIN storage_locations sl ON sl.id = ce.%[2]s
+		ORDER BY COALESCE(sl.%[5]s, ce.%[6]s) ASC
+		LIMIT ?`,
+		d.col("entryId"), d.col("locationId"), d.col("folderName"), d.col("sizeBytes"),
+		d.col("lastDownloadedAt"), d.col("updatedAt"))
+	start := time.Now()
+	err := d.SelectContext(ctx, &entries, d.Rebind(query), limit)
+	d.recordDBQuery(ctx, "cache_entries", start)
+	return entries, err
 }
 
 // DeleteCacheEntriesByLocationID deletes cache entries by location ID.

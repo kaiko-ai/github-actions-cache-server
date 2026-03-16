@@ -70,6 +70,7 @@ type Config struct {
 	CacheCleanupOlderThanDays int
 	DisableCleanupJobs        bool
 	EnableDirectDownloads     bool
+	MaxCacheSizeBytes         int64
 }
 
 // RegisterFlags registers all CLI flags on the given cobra command and sets up
@@ -131,6 +132,7 @@ func RegisterFlags(cmd *cobra.Command) {
 	f.Int("cache-cleanup-older-than-days", 90, "Delete cache entries older than N days")
 	f.Bool("disable-cleanup-jobs", false, "Disable all scheduled cleanup jobs")
 	f.Bool("enable-direct-downloads", false, "Enable signed direct download URLs")
+	f.Int64("max-cache-size-bytes", 0, "Maximum total cache size in bytes (0 = unlimited)")
 
 	// Wire up viper: flags → viper ← env vars
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
@@ -186,6 +188,7 @@ func Load() (*Config, error) {
 		CacheCleanupOlderThanDays: viper.GetInt("cache-cleanup-older-than-days"),
 		DisableCleanupJobs:        viper.GetBool("disable-cleanup-jobs"),
 		EnableDirectDownloads:     viper.GetBool("enable-direct-downloads"),
+		MaxCacheSizeBytes:         viper.GetInt64("max-cache-size-bytes"),
 	}
 
 	if err := cfg.Validate(); err != nil {

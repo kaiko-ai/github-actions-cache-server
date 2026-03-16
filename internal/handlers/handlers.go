@@ -126,8 +126,15 @@ func (h *Handler) handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// handleHealth returns health status.
+// handleHealth returns health status with a real DB probe.
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if err := h.db.PingContext(ctx); err != nil {
+		h.logger.Error("health check failed", "error", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("unhealthy: database unreachable"))
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("healthy"))
 }
@@ -491,6 +498,7 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 		ID:         locationID,
 		FolderName: upload.FolderName,
 		PartCount:  partCount,
+		SizeBytes:  actualSize,
 	}
 
 	cacheEntry := &db.CacheEntry{
@@ -516,6 +524,11 @@ func (h *Handler) handleFinalizeCacheEntryUpload(w http.ResponseWriter, r *http.
 				h.logger.Error("failed to delete old storage folder", "error", err, "folder", result.OldFolderName)
 			}
 		}()
+	}
+
+	// Enforce storage quota via LRU eviction
+	if h.config.MaxCacheSizeBytes > 0 {
+		go h.evictIfOverQuota()
 	}
 
 	// Return upload.ID as the entry_id (not the new UUID)
@@ -885,6 +898,62 @@ func (h *Handler) mergeInBackground(locationID, folderName string) {
 
 	h.recordMergeResult(ctx, "success", mergeStart, bytesWritten)
 	h.logger.Info("merged cache entry", "locationId", locationID, "parts", len(indices), "bytes", bytesWritten)
+}
+
+// evictIfOverQuota checks the total cache size and evicts LRU entries until under budget.
+func (h *Handler) evictIfOverQuota() {
+	ctx := context.Background()
+	maxSize := h.config.MaxCacheSizeBytes
+
+	totalSize, err := h.db.GetTotalCacheSize(ctx)
+	if err != nil {
+		h.logger.Error("failed to get total cache size for eviction", "error", err)
+		return
+	}
+
+	if totalSize <= maxSize {
+		return
+	}
+
+	h.logger.Info("cache over quota, starting LRU eviction", "totalSize", totalSize, "maxSize", maxSize)
+
+	evicted := 0
+	for totalSize > maxSize {
+		entries, err := h.db.GetLRUCacheEntries(ctx, 10)
+		if err != nil {
+			h.logger.Error("failed to get LRU entries for eviction", "error", err)
+			return
+		}
+		if len(entries) == 0 {
+			break
+		}
+
+		for _, entry := range entries {
+			if totalSize <= maxSize {
+				break
+			}
+
+			if err := h.storage.DeleteFolder(ctx, entry.FolderName); err != nil {
+				h.logger.Error("failed to delete storage for eviction", "error", err, "folder", entry.FolderName)
+				continue
+			}
+			if err := h.db.DeleteCacheEntriesByLocationID(ctx, entry.LocationID); err != nil {
+				h.logger.Error("failed to delete cache entry for eviction", "error", err, "locationId", entry.LocationID)
+				continue
+			}
+			if err := h.db.DeleteStorageLocation(ctx, entry.LocationID); err != nil {
+				h.logger.Error("failed to delete storage location for eviction", "error", err, "locationId", entry.LocationID)
+				continue
+			}
+
+			totalSize -= entry.SizeBytes
+			evicted++
+		}
+	}
+
+	if evicted > 0 {
+		h.logger.Info("LRU eviction completed", "evicted", evicted, "newTotalSize", totalSize)
+	}
 }
 
 // handleCatchAllProxy proxies unknown requests to GitHub results receiver.

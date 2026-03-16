@@ -33,3 +33,5 @@ CREATE INDEX IF NOT EXISTS idx_uploads_key_version ON uploads(key, version);
 
 ALTER TABLE uploads ADD COLUMN uploadedBytes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE uploads ADD COLUMN uploadedParts INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE storage_locations ADD COLUMN sizeBytes INTEGER NOT NULL DEFAULT 0;
